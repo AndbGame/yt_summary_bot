@@ -19,18 +19,27 @@ live-smoke вручную. Всё остальное — быстрые дете
 .venv/Scripts/python.exe -m pytest                  # всё, кроме live
 .venv/Scripts/python.exe -m pytest tests/unit       # только юнит
 .venv/Scripts/python.exe -m pytest -m live          # только live (нужны токены)
-.venv/Scripts/python.exe -m ruff check yt_summary_bot.py tests/
+.venv/Scripts/python.exe -m ruff check bot tests yt_summary_bot.py
 ```
 
 ## Что уже покрыто (карта тест → модуль)
 
-| Файл | Проверяет |
-|---|---|
-| `tests/unit/test_youtube_link.py` | YT-регекс (watch/shorts/live/embed/youtu.be/m., мультистрочность, ложные срабатывания), имя треда |
-| `tests/unit/test_discord_formatting.py` | таблицы→буллеты (в т.ч. внутри code-fence), fence-aware сплит: лимиты 2000, индикаторы `(i/N)`, переоткрытие фенса с языком, неразрывный текст |
-| `tests/unit/test_llm_retry.py` | парсинг `Retry-After` (хедеры/body/кэп), цикл ретраев: 429→успех с экспонентой, пустой ответ, невретраебельные ошибки, обрезка субтитров |
-| `tests/unit/test_outbox.py` | буфер: roundtrip/unicode, битый файл, атомарная запись, классификация ретраебельных ошибок отправки |
-| `tests/e2e/test_pipeline.py` | полный путь на фейках: чанкование и формат длинного саммари, ошибка субтитров → сообщение об ошибке, офлайн-Discord → буфер → досылка по порядку, мёртвый тред → отбрасывание, роутинг/дедуп в очередь |
+После фазы 0 (монолит расщеплён в пакет `bot/`, тесты перенесены 1:1 + расширены):
+
+| Файл | Проверяет | Модуль |
+|---|---|---|
+| `tests/unit/test_config.py` | дефолты, .env-чтение, приоритет env, мусорные int → дефолт, missing_fields | `bot/config.py` |
+| `tests/unit/test_render.py` | таблицы→буллеты (в т.ч. в code-fence), fence-aware сплит: 2000, `(i/N)`, переоткрытие фенса | `bot/delivery/render.py` |
+| `tests/unit/test_llm.py` | `Retry-After` (кэп из конфига), ретраи 429/сети, параметры API-вызова из конфига, обрезка субтитров | `bot/analysis/llm.py` |
+| `tests/unit/test_outbox.py` | JSON-буфер: unicode, битый файл, атомарная запись | `bot/delivery/outbox.py` |
+| `tests/unit/test_sender.py` | safe_send ретраи/4xx без ретрая, flush: порядок/мёртвые треды/стоп-на-сбое, flush_loop | `bot/delivery/sender.py` |
+| `tests/unit/test_youtube.py` | YT-регекс (все форматы, ложные срабатывания), имя треда | `bot/sources/youtube.py` |
+| `tests/unit/test_jobs.py` | очередь, живучесть воркера при исключениях | `bot/jobs.py` |
+| `tests/unit/test_import_clean.py` | импорт `bot.*` без side effects (холодный импорт в подпроцессе без токенов/.env) | весь пакет |
+| `tests/e2e/test_pipeline.py` | полный путь job: чанки/формат, ошибка → сообщение, офлайн → буфер → досылка, error-путь без диска | `bot/pipeline.py` |
+| `tests/e2e/test_handle.py` | роутинг ссылки, дедуп, 160004, Forbidden, позиция в очереди | `bot/discord_app.py` |
+| `tests/e2e/test_discord_app.py` | on_ready: однократный старт воркеров, flush при старте | `bot/discord_app.py` |
+| `tests/e2e/test_main.py` | build_deps (реальная композиция), main(): валидация/env-имена, запуск | `bot/main.py` |
 
 ## E2E in-process: как устроено
 

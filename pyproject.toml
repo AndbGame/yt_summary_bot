@@ -14,3 +14,6 @@ select = ["E", "F", "W", "I", "B", "UP"]
 ignore = [
     "E501",  # длинные докстринги/сообщения на русском — норм для этого репо
 ]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bot", "yt_summary_bot"]

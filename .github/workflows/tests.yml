@@ -1,0 +1,15 @@
+# CI: тесты без сети (live-тесты — только вручную, см. docs/TESTING.md)
+name: tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # как в Docker-образе
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check bot tests yt_summary_bot.py
+      - run: pytest

@@ -10,9 +10,9 @@ Discord-бот: YouTube-ссылка в сообщении → тред с LLM-�
 
 ```bash
 # всё через venv репозитория (Windows)
-.venv/Scripts/python.exe yt_summary_bot.py        # запуск бота (нужен .env)
-.venv/Scripts/python.exe -m pytest                # тесты (без сети, ~1с)
-.venv/Scripts/python.exe -m ruff check yt_summary_bot.py tests/
+.venv/Scripts/python.exe yt_summary_bot.py        # запуск бота (нужен .env; это шим -> bot.main)
+.venv/Scripts/python.exe -m pytest                # тесты (без сети, ~1.5с)
+.venv/Scripts/python.exe -m ruff check bot tests yt_summary_bot.py
 docker compose up -d --build                      # прод-запуск
 ```
 
@@ -21,10 +21,13 @@ docker compose up -d --build                      # прод-запуск
 
 ## Текущее состояние и направление
 
-Код — один файл `yt_summary_bot.py`. Это осознанно до фазы 0; дальше —
-постепенный переход на пакет `bot/` по фазам из ARCHITECTURE.md §12
-(strangler-паттерн). **Не переписывать всё сразу**: после каждого шага бот
-остаётся запускаемым, фазы маленькие.
+Код — пакет `bot/` (фаза 0 миграции завершена): `config.py` (env-конфиг),
+`pipeline.py` (Deps + process_job), `discord_app.py` (события/треды),
+`jobs.py` (очередь), `analysis/` (llm, prompts), `sources/youtube.py`,
+`delivery/` (render, outbox, sender), `main.py` (композиция build_deps/main).
+`yt_summary_bot.py` — шим для совместимости запуска. Дальше — фазы 1–5
+из ARCHITECTURE.md §12 (strangler-паттерн). **Не переписывать всё сразу**:
+после каждого шага бот остаётся запускаемым, фазы маленькие.
 
 Ключевые плановые вектора (мотивация всех архитектурных решений):
 
@@ -56,12 +59,15 @@ docker compose up -d --build                      # прод-запуск
   ENTRYPOINT-обёртке Dockerfile, не убирать.
 - **certifi в Docker подменён симлинком на системный CA-стор** — часть
   образа, связана с цепочками конкретного LLM-провайдера.
-- **`max_tokens=50000` рассчитан на GLM**; у OpenAI-моделей лимит ниже →
-  мгновенные 400. Значение должно стать конфигом (фаза 0).
+- **`max_tokens` теперь конфиг** (`LLM_MAX_TOKENS`, дефолт 50000 рассчитан на GLM);
+  у OpenAI-моделей лимит ниже → мгновенные 400.
 - **Один LLM-воркер** — не добавлять параллельные LLM-вызовы без общего
   rate limiter'а; провайдер лимитирует.
 - **160004** («тред уже существует») — обрабатывается переиспользованием
   треда, не ошибкой. Сохранять это поведение.
+- **Импорт `bot.*` без side effects** — конфиг/клиент создаются только в
+  `build_deps`/`create_client`; закреплено тестом test_import_clean. Не вернуть
+  в конец: загрузку .env на импорте, discord.Client на уровне модуля.
 - Python: локально 3.14, в Docker 3.12 — писать код, совместимый с 3.12
   (`target-version = py312` в ruff).
 - venv локальный может отставать от `requirements.txt` (так было с pyyaml) —
