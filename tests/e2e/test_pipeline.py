@@ -16,7 +16,6 @@ monkeypatch bot.pipeline.fetch_transcript больше не нужен: конт
 """
 
 import asyncio
-import re
 from types import SimpleNamespace
 
 import discord
@@ -31,27 +30,17 @@ URL = f"https://youtu.be/{VIDEO_ID}"
 LINK = URL  # рендер-ссылка = doc.url экстрактора
 
 
-def _long_section_body(with_fence):
-    if not with_fence:
-        return "\n".join(f"абзац {j} подробностей " + "т" * 90 for j in range(25))
-    return (
-        "вступление раздела\n\n```python\n"
-        + "\n".join(f"print({n})" for n in range(250))
-        + "\n```\n"
-        + "завершение раздела"
-    )
-
-
-# Большой отчёт: тезисы сверх бюджета/порога, длинные разделы, в одном —
-# code-fence, чтобы упражнять fence-aware чанк-сплит внутри сообщения-раздела.
+# Компактный отчёт (UX-итерация): тайминги — по одной строке, «Подробно»
+# на 20 секциях не влезает в один пост (упаковывается в два); тезисы —
+# под промпт-цель (1100) и бюджет (1300), без маркера обрезки.
 BIG_ANALYSIS = {
     "brief": "Суть видео в двух предложениях: о чём оно и зачем его смотреть.",
     "complexity": "simple",
     "context": "",
-    "theses": [f"тезис номер {i}: " + "с" * 90 for i in range(14)],
+    "theses": [f"тезис номер {i}: " + "с" * 90 for i in range(12)],
     "sections": [
-        {"title": f"Раздел {i}", "start_sec": i * 700, "body": _long_section_body(i == 1)}
-        for i in range(6)
+        {"title": f"Раздел {i}", "start_sec": i * 140, "body": f"короткое описание {i} " + "х" * 80}
+        for i in range(20)
     ],
 }
 
@@ -100,28 +89,24 @@ class TestHappyPath:
 
         sent = thread.sent
         assert sent, "сообщения не отправлены"
-        # порядок: кратко (с заголовком разбора) -> тезисы -> подробно по разделам
+        # компактность: 20 таймингов по одной строке — 4 сообщения
+        # (Разбор+Кратко, Тезисы, Подробно ×2), а не пост на каждый тайминг
+        assert len(sent) == 4
         assert sent[0].startswith(f"**Разбор: <{LINK}>**\n\n**Кратко**")
-        idx_theses = next(n for n, c in enumerate(sent) if c.startswith("**Тезисы**"))
-        assert 0 < idx_theses
-        section_starts = [
-            next(n for n, c in enumerate(sent) if c.startswith(f"**Раздел {i}**")) for i in range(6)
-        ]
-        assert section_starts == sorted(section_starts)
-        assert all(s > idx_theses for s in section_starts)
-        # заголовок разбора ровно один — в первом сообщении
+        assert sent[1].startswith("**Тезисы**")
+        # Подробно: шапка + по строке на тайминг, ссылки маскированы
+        podrobno = [s for s in sent if s.startswith("**Подробно**")]
+        assert len(podrobno) == 2, "тайминги упакованы в два поста"
+        lines = "\n".join(p.split("\n\n", 1)[1] for p in podrobno).split("\n")
+        assert len(lines) == 20
+        for i, line in enumerate(lines):
+            sec = i * 140
+            stamp = f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60:02d}:{sec % 60:02d}"
+            assert line.startswith(f"[{stamp}](<{LINK}?t={sec}>)"), line
+            assert f"**Раздел {i}**: короткое описание {i}" in line
+        # заголовок разбора ровно один; всё в лимите Discord-сплита
         assert sum(c.count("**Разбор:") for c in sent) == 1
-        # все чанки в лимите Discord-сплита
         assert all(len(c) <= deps.config.split_threshold for c in sent)
-        # длинные сообщения порезаны с индикаторами (i/N) внутри своего сообщения
-        assert any(re.search(r" \(\d+/\d+\)$", c) for c in sent)
-        # код-блоки не разорваны: суммарно чётное число фенсов, переоткрытие с языком
-        fences = sum(c.count("\n```") + c.startswith("```") for c in sent)
-        assert fences % 2 == 0
-        assert any(c.startswith("```python") for c in sent)
-        # содержимое не потерялось: все разделы и хвост длинного раздела доставлены
-        assert all(f"**Раздел {i}**" in "".join(sent) for i in range(6))
-        assert "завершение раздела" in "".join(sent)
         assert status.deleted
         # контент экстрактора дошёл до LLM в неизменном виде
         assert deps.llm.calls == ["субтитры"]
@@ -408,7 +393,7 @@ class TestOfflineDiscord:
 
         # первые два сообщения доставлены целиком
         assert thread.sent[:ok_sends] == flat[:ok_sends]
-        # упавший чанк — первый чанк следующего (многоблочного) сообщения-раздела
+        # упавший чанк — первый чанк следующего сообщения (первое «Подробно»)
         assert thread.sent[ok_sends] == chunks_per_msg[2][0]
         # в буфере полный хвост: упавшее сообщение целиком + все последующие
         items = deps.outbox.load()
@@ -416,10 +401,10 @@ class TestOfflineDiscord:
         assert buffered == chunks_per_msg[2] + [c for cs in chunks_per_msg[3:] for c in cs]
         assert len(buffered) > len(chunks_per_msg[2]), "буферизованы и последующие сообщения отчёта"
         # порядок: первый буферизованный — упавший чанк; последний содержит текст
-        # ПОСЛЕДНЕГО сообщения отчёта (хвост раздела 5) — конец разбора не потерян
+        # ПОСЛЕДНЕГО сообщения отчёта (хвост раздела 19) — конец разбора не потерян
         assert buffered[0] == chunks_per_msg[2][0]
         assert buffered[-1] == flat[-1]
-        assert "абзац 24 подробностей" in buffered[-1]
+        assert "короткое описание 19" in buffered[-1]
         assert all(i["thread_id"] == thread.id for i in items)
         # отправка не завершена — статусное сообщение остаётся
         assert not status.deleted

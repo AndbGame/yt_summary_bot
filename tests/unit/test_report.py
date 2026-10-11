@@ -260,14 +260,16 @@ class TestRenderMessages:
     def test_full_report_message_order(self):
         report = Report.from_analysis(FULL_ANALYSIS)
         msgs = render_report_messages(report, URL)
-        # кратко(+контекст) -> тезисы -> разделы упакованы в ОДНО сообщение
-        # (компактность: один пост на тайминг — шум в канале)
+        # кратко(+контекст) -> тезисы -> тайминги одной строкой под «Подробно»
         assert msgs[0] == (
             "**Кратко**\n\nСуть видео.\n\n> *Простыми словами:* это разбор устройства сервера для новичков"
         )
         assert msgs[1] == "**Тезисы**\n\n- тезис один\n- тезис два"
-        assert msgs[2].startswith("**Вступление**")
-        assert "**Детали**\n\nтело деталей" in msgs[2]
+        assert msgs[2] == (
+            "**Подробно**\n\n"
+            f"[01:15](<{URL}?t=75>) — **Вступление**: тело вступления\n"
+            "**Детали**: тело деталей"
+        )
         assert len(msgs) == 3
 
     def test_sections_packed_into_one_message_when_fit(self):
@@ -332,17 +334,16 @@ class TestRenderMessages:
             {"brief": "Б", "sections": [{"title": "S", "start_sec": 75, "body": "б"}]}
         )
         msg = render_report_messages(report, URL)[1]
-        # ссылка маскируется <url>: без этого Discord на каждый тайминг рисует
-        # превью-встройку видео
-        assert msg.startswith(f"**S**\n\n[01:15](<{URL}?t=75>)")
-        assert msg.index(f"[01:15](<{URL}?t=75>)") < msg.index("б")
+        # одна строка на тайминг; ссылка маскируется <url> — иначе Discord
+        # рисует превью-встройку видео
+        assert msg == f"**Подробно**\n\n[01:15](<{URL}?t=75>) — **S**: б"
 
     def test_start_sec_becomes_hours_link(self):
         report = Report.from_analysis(
             {"brief": "Б", "sections": [{"title": "S", "start_sec": 3675, "body": "б"}]}
         )
         msg = render_report_messages(report, URL)[1]
-        assert f"[1:01:15](<{URL}?t=3675>)" in msg
+        assert f"[1:01:15](<{URL}?t=3675>) — **S**: б" in msg
 
     def test_start_sec_zero_still_links_to_beginning(self):
         # 0 секунд — валидный таймкод начала видео: ссылка со ?t=0, метка 00:00
@@ -350,11 +351,20 @@ class TestRenderMessages:
             {"brief": "Б", "sections": [{"title": "S", "start_sec": 0, "body": "б"}]}
         )
         msg = render_report_messages(report, URL)[1]
-        assert f"[00:00](<{URL}?t=0>)" in msg
+        assert f"[00:00](<{URL}?t=0>) — **S**: б" in msg
 
     def test_section_without_start_sec_no_link(self):
         report = Report.from_analysis({"brief": "Б", "sections": [{"title": "S", "body": "б"}]})
-        assert render_report_messages(report, URL)[1] == "**S**\n\nб"
+        assert render_report_messages(report, URL)[1] == "**Подробно**\n\n**S**: б"
+
+    def test_section_body_collapsed_to_one_line(self):
+        # LLM вернул переносы — рендер схлопывает: строка есть строка
+        report = Report.from_analysis(
+            {"brief": "Б", "sections": [{"title": "S", "start_sec": 10, "body": "первая\n\nвторая\nтретья"}]}
+        )
+        msg = render_report_messages(report, URL)[1]
+        assert "первая вторая третья" in msg
+        assert "\nвторая" not in msg
 
     def test_author_block_rendered_last_regardless_of_position(self):
         report = Report(
@@ -371,7 +381,7 @@ class TestRenderMessages:
     def test_missing_blocks_skipped(self):
         # нет theses -> нет сообщения тезисов; есть только то, что есть
         report = Report.from_analysis({"sections": [{"title": "S", "body": "б"}]})
-        assert render_report_messages(report, URL) == ["**S**\n\nб"]
+        assert render_report_messages(report, URL) == ["**Подробно**\n\n**S**: б"]
 
     def test_empty_report_renders_no_messages(self):
         assert render_report_messages(Report([]), URL) == []
@@ -396,13 +406,13 @@ class TestRenderMessages:
         assert TRUNCATED in theses_msg
         assert ("- " + "т" * 30) not in theses_msg, "тезисы обрезаны до бюджета"
 
-    def test_budgets_do_not_truncate_detailed(self):
-        # detailed рендер не режет: это работа чанк-сплиттера пайплайна
-        budgets = {"brief": 240, "context": 400, "theses": 1200, "section": 50}
+    def test_budget_truncates_section_line_with_marker(self):
+        # секция — одна строка: бюджет секции режет тело до лимита с маркером
+        budgets = {"brief": 240, "context": 400, "theses": 1300, "section": 50}
         report = Report.from_analysis({"brief": "Б", "sections": [{"title": "S", "body": "Д" * 200}]})
         msgs = render_report_messages(report, URL, budgets=budgets)
-        assert msgs[1] == f"**S**\n\n{'Д' * 200}"
-        assert TRUNCATED not in msgs[1]
+        assert msgs[1] == f"**Подробно**\n\n**S**: {'Д' * 50}{TRUNCATED}"
+        assert "Д" * 51 not in msgs[1]
 
     def test_no_budgets_no_truncation(self):
         report = Report.from_analysis({"brief": "Б" * 500})

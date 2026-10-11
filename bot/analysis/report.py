@@ -209,15 +209,15 @@ def validate_budgets(report: Report, budgets: dict | None) -> list[str]:
 def render_report_messages(
     report: Report, url: str, budgets: dict | None = None, section_budget: int = 1900
 ) -> list[str]:
-    """Прогрессивный рендер: кратко (+контекст) -> тезисы -> разделы -> автор.
+    """Прогрессивный рендер: кратко (+контекст) -> тезисы -> тайминги -> автор.
 
     Правила границ ответственности:
     - заголовок разбора «**Разбор: Название (Автор)**» добавляет pipeline
       (он знает метаданные джобы), не рендер;
-    - detailed-блоки УПАКОВЫВАЮТСЯ в как можно меньше сообщений (лимит
-      section_budget на сообщение): один пост на тайминг — шум, читатель
-      хочет компактный разбор; одиночное длинное сообщение дальше режет
-      чанк-сплиттер пайплайна с fence-восстановлением;
+    - detailed-блоки — ПО ОДНОЙ СТРОКЕ на тайминг («[00:19](<url>) — Название:
+      описание»), упакованные в 1-2 сообщения (лимит section_budget): список
+      таймингов — навигация по видео, а не пересказ; переносы внутри body
+      схлопываются, тело укорачивается до бюджета секции;
     - brief/context/theses укорачиваются до бюджетов с маркером — это уже
       финальный вид, чанк-сплиттеру резать их не потребуется;
     - автор — последний независимо от позиции блока: финальный контекст;
@@ -242,25 +242,37 @@ def render_report_messages(
     if theses is not None:
         messages.append(f"**Тезисы**\n\n{_fit(theses.body_md, budgets, 'theses')}")
 
-    packed: list[str] = []
-    buf: list[str] = []
-    buf_len = 0
+    lines: list[str] = []
     for block in report.blocks:
         if block.kind != "detailed":
             continue
         link = _time_link(block.data.get("start_sec"), url)
-        body = f"{link}\n\n{block.body_md}" if link else block.body_md
-        part = f"**{block.title}**\n\n{body}"
-        # грубая упаковка по символам: точную подгонку всё равно делает
-        # чанк-сплиттер, здесь важно не плодить сообщения
-        if buf and buf_len + len(part) + 2 > section_budget:
-            packed.append("\n\n".join(buf))
-            buf, buf_len = [], 0
-        buf.append(part)
-        buf_len += len(part) + 2
-    if buf:
-        packed.append("\n\n".join(buf))
-    messages.extend(packed)
+        body = " ".join(block.body_md.split())  # одна строка: переносы LLM схлопываем
+        body = _fit(body, budgets, "section")
+        title = block.title.strip()
+        if link and title:
+            lines.append(f"{link} — **{title}**: {body}" if body else f"{link} — **{title}**")
+        elif link:
+            lines.append(f"{link} — {body}" if body else link)
+        elif title:
+            lines.append(f"**{title}**: {body}" if body else f"**{title}**")
+        elif body:
+            lines.append(body)
+    if lines:
+        # грубая упаковка по символам с шапкой «Подробно»; точную подгонку
+        # всё равно делает чанк-сплиттер, здесь важно уложиться в 1-2 поста
+        packed: list[str] = []
+        buf: list[str] = []
+        buf_len = len("**Подробно**\n\n")
+        for line in lines:
+            if buf and buf_len + len(line) + 1 > section_budget:
+                packed.append(buf)
+                buf, buf_len = [], len("**Подробно**\n\n")
+            buf.append(line)
+            buf_len += len(line) + 1
+        if buf:
+            packed.append(buf)
+        messages.extend("**Подробно**\n\n" + "\n".join(chunk) for chunk in packed)
 
     author = next((b for b in report.blocks if b.kind == "author"), None)
     if author is not None:

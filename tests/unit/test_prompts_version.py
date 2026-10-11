@@ -16,9 +16,9 @@ from bot.analysis.prompts import load_prompts
 def test_prompts_yaml_declares_version():
     prompts = load_prompts()
     assert "version" in prompts, "prompts.yaml должен объявлять version — она входит в ключ кеша"
-    # фаза 2: JSON-схема ответа LLM -> версия 2; фаза 5: статьи — тот же вызов,
-    # но промпт говорит про «материал (субтитры видео или текст статьи)» -> 3
-    assert str(prompts["version"]) == "3"
+    # фаза 2: JSON-схема -> 2; фаза 5: статьи -> 3; UX-итерация: тайминги
+    # одной строкой + ужесточённые цели для LLM -> 4
+    assert str(prompts["version"]) == "4"
 
 
 def test_content_analysis_user_mentions_articles():
