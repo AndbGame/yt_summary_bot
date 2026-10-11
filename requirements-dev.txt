@@ -1,0 +1,4 @@
+# Дев-зависимости (локальная разработка и тесты). Прод-зависимости — requirements.txt
+-r requirements.txt
+pytest>=8
+ruff>=0.6
