@@ -1,24 +1,24 @@
-"""Discord-адаптер: события, треды, статусные сообщения, дедуп.
+"""Discord-адаптер: события, треды, статусные сообщения, дедуп, recovery.
 
 discord.Client создаётся ТОЛЬКО в фабрике create_client(): импорт пакета
 остаётся чистым — без токенов, без .env и без клиентов (см.
 tests/unit/test_import_clean.py). Обработчики вешаются отдельно в
 attach_handlers(), когда deps уже собран.
+
+Фаза 4: маршрут сообщения определяет Router (реестр экстракторов), дедуп и
+джобы живут в БД (in-memory set удалён — дедуп переживает рестарт); недоделанные
+джобы после рестарта возвращаются в очередь recover_jobs'ом ДО старта воркеров.
 """
 
 import asyncio
 import logging
+import re
 
 import discord
 
 from bot.jobs import author_refresh_worker, llm_worker
-from bot.sources.youtube import extract_video_id, thread_name_from_message
 
 log = logging.getLogger("yt-summary")
-
-# защита от повторной обработки (редакты/репосты той же ссылки); in-memory
-# осознанно — персистентный дедуп появится в БД (фаза 4, ARCHITECTURE.md §10)
-processed: set = set()
 
 
 def default_intents() -> discord.Intents:
@@ -35,11 +35,21 @@ def create_client() -> discord.Client:
     return discord.Client(intents=default_intents())
 
 
+def thread_name_from_message(text: str, route) -> str:
+    """Имя треда: текст сообщения без ссылки (срез границ роутера).
+
+    Осталось пусто (сообщение было только ссылкой) — «Разбор <url>»; лимит
+    Discord — 100 символов, режем до 90 с запасом.
+    """
+    stripped = re.sub(r"\s+", " ", (text[: route.start] + text[route.end :])).strip()
+    return stripped[:90] if stripped else f"Разбор {route.url}"[:90]
+
+
 async def find_existing_thread(message: discord.Message):
     """Ищет тред, созданный из этого сообщения (его id == message.id).
 
     Нужно после перезапуска бота: тред мог быть создан прошлым запуском,
-    а in-memory дедуп потерян — Discord не даст создать второй тред (160004).
+    а дедуп в БД его не помнит — Discord не даст создать второй тред (160004).
     """
     ch = message.channel
     for t in list(getattr(ch, "threads", []) or []):
@@ -54,23 +64,54 @@ async def find_existing_thread(message: discord.Message):
     return None
 
 
-async def handle(message: discord.Message, deps) -> None:
-    """Роутинг: YouTube-ссылка -> тред + статус -> задача в очередь (дедуп «id:видео»)."""
-    found = extract_video_id(message.content)
-    if not found:
-        return
-    video_id = found[0]
-    key = f"{message.id}:{video_id}"
-    if key in processed:
-        return
-    processed.add(key)
-    if len(processed) > 2000:
-        processed.clear()
+async def _fetch_status(client, job: dict):
+    """Статусное сообщение восстановленной джобы; любой сбой — None.
 
-    log.info("видео %s в #%s от %s", video_id, message.channel, message.author)
+    Тред мог быть удалён, статусное сообщение — стёрто вручную: разбор потерять
+    нельзя, а статус опционален (пайплайн допускает джобу без статуса).
+    """
+    try:
+        thread = client.get_channel(job.get("thread_id"))
+        return await thread.fetch_message(job.get("status_message_id"))
+    except Exception:
+        return None
+
+
+async def recover_jobs(deps) -> None:
+    """Возвращает в очередь недоделанные джобы из БД (state=new) после рестарта.
+
+    Вызывается однократно из on_ready ДО старта воркеров (общий с ними guard):
+    иначе джоба могла бы обработаться дважды — из recovery и из очереди, куда
+    её уже поставили. Статус прикрепляется через fetch_message; джоба без
+    статуса всё равно ставится — разбор потерять нельзя.
+    """
+    jobs = getattr(deps, "jobs", None)
+    if jobs is None:
+        return
+    pending = jobs.take_new()
+    if not pending:
+        return
+    log.info("восстанавливаю после рестарта джоб: %d", len(pending))
+    for job in pending:
+        job["status"] = await _fetch_status(deps.client, job)
+        deps.queue.put_nowait(job)
+
+
+async def handle(message: discord.Message, deps) -> None:
+    """Роутинг: ссылка -> экстрактор -> дедуп -> тред + статус -> джоба в БД и очередь."""
+    route = deps.router.route(message.content or "")
+    if route is None:
+        return
+    url = route.url
+    canonical = route.extractor.canonical_id(url)
+
+    dedup = getattr(deps, "dedup", None)
+    if dedup is not None and not dedup.mark(str(message.id), canonical):
+        return
+
+    log.info("источник %s в #%s от %s", url, message.channel, message.author)
 
     status = None
-    thread = None
     try:
         status = await message.reply("🎬 Смотрю субтитры, готовлю тезисы...")
     except discord.HTTPException:
@@ -78,7 +119,7 @@ async def handle(message: discord.Message, deps) -> None:
 
     try:
         thread = await message.create_thread(
-            name=thread_name_from_message(message.content, video_id),
+            name=thread_name_from_message(message.content, route),
             auto_archive_duration=1440,
         )
     except discord.Forbidden:
@@ -105,12 +146,33 @@ async def handle(message: discord.Message, deps) -> None:
         except discord.HTTPException:
             pass
 
-    await deps.queue.put({
-        "video_id": video_id,
+    # payload в БД — без status-объекта (не сериализуется); статус прикрепляется
+    # к джобе в очереди, после рестарта восстанавливается по status_message_id
+    payload = {
+        "kind": route.extractor.name,
+        "url": url,
+        "canonical_id": canonical,
         "thread_id": thread.id,
         "message_id": message.id,
-        "status": status,
-    })
+        "status_message_id": status.id if status else None,
+    }
+    jobs = getattr(deps, "jobs", None)
+    try:
+        job_id = jobs.put(payload) if jobs is not None else None
+    except Exception:
+        # БД недоступна: без записи джоба пережила бы рестарт только молчаливой
+        # потерей — в очередь её не ставим, пользователь получает честный отказ
+        # (исключение не пробрасывается: on_message не должен логировать падение)
+        log.exception("джоба не поставлена в БД (%s)", url)
+        if status:
+            try:
+                await status.edit(
+                    content="⚠️ Не удалось поставить разбор в очередь, попробуйте позже."
+                )
+            except discord.HTTPException:
+                pass
+        return
+    await deps.queue.put({**payload, "job_id": job_id, "status": status})
 
 
 def attach_handlers(client: discord.Client, deps) -> discord.Client:
@@ -123,6 +185,12 @@ def attach_handlers(client: discord.Client, deps) -> discord.Client:
         log.info("запущен как %s (серверов: %d)", client.user, len(client.guilds))
         if not bg_started:
             bg_started = True
+            # восстановление джоб из БД — строго ДО старта воркеров (общий guard
+            # с ними: переподключение восстановление не дублирует)
+            try:
+                await recover_jobs(deps)
+            except Exception:
+                log.exception("восстановление джоб после рестарта упало")
             asyncio.create_task(llm_worker(deps.queue, deps))
             asyncio.create_task(deps.sender.flush_loop())
             # фазовое обновление обзоров авторов — тоже бесконечный воркер,

@@ -1,9 +1,18 @@
-"""Распознавание YouTube-ссылок и скачивание субтитров."""
+"""YouTube-источник (фаза 4): экстрактор за портом + скачивание субтитров.
+
+YoutubeExtractor — первая реализация ExtractorPort: find/matches/canonical_id
+чистые (сеть не трогают), extract добывает субтитры через инжектируемый
+fetch_transcript (в тестах — фейк). Метаданных (oEmbed/title) extract не
+добывает — ref автора ушел провайдеру фактов (bot/analysis/author.py), чтобы
+сети в пайплайне был ровно один поход — за транскриптом.
+"""
 
 import logging
 import re
 
 import youtube_transcript_api
+
+from bot.sources.base import SourceDocument
 
 log = logging.getLogger("yt-summary")
 
@@ -31,12 +40,6 @@ def canonical_video_id(video_id: str) -> str:
     return f"youtube:video:{video_id}"
 
 
-def thread_name_from_message(text: str, video_id: str) -> str:
-    """Имя треда: текст сообщения без ссылки, либо 'Видео <id>' (монолитный build_thread_name)."""
-    text = YT_RE.sub("", text).strip() or f"Видео {video_id}"
-    return text[:90]
-
-
 def fetch_transcript(video_id: str) -> str:
     """Скачивает субтитры (ru -> en -> любые), возвращает текст с таймкодами."""
     api = youtube_transcript_api.YouTubeTranscriptApi()
@@ -55,3 +58,50 @@ def fetch_transcript(video_id: str) -> str:
         stamp = f"{h}:{mm:02d}:{sec:02d}" if h else f"{mm:02d}:{sec:02d}"
         lines.append(f"[{stamp}] {s.text}")
     return "\n".join(lines)
+
+
+# Алиас нужен, потому что параметр __init__ экстрактора называется fetch_transcript
+# и затеняет функцию внутри своего scope (см. bot/analysis/author.py с fetch)
+_DEFAULT_FETCH_TRANSCRIPT = fetch_transcript
+
+
+class YoutubeExtractor:
+    """Экстрактор YouTube-видео за портом ExtractorPort (ARCHITECTURE.md §5-§6).
+
+    find — основной метод порта (границы совпадения для Router), matches
+    производен от него; canonical_id — «youtube:video:<id>», ключ кеша отчётов.
+    Сеть трогает только extract через fetch_transcript (инжектируется в тестах).
+    """
+
+    name = "video"
+
+    def __init__(self, fetch_transcript=None):
+        self._fetch_transcript = fetch_transcript or _DEFAULT_FETCH_TRANSCRIPT
+
+    def find(self, text: str) -> tuple[int, int] | None:
+        """Границы первой YouTube-ссылки в тексте или None."""
+        m = YT_RE.search(text or "")
+        return (m.start(), m.end()) if m else None
+
+    def matches(self, url: str) -> bool:
+        """Производный предикат порта: find(url) нашёл ссылку."""
+        return self.find(url) is not None
+
+    def canonical_id(self, url: str) -> str | None:
+        """«youtube:video:<id>» по ссылке или None, если ссылка не YouTube."""
+        found = extract_video_id(url)
+        return canonical_video_id(found[0]) if found else None
+
+    def extract(self, url: str) -> SourceDocument:
+        """Субтитры -> SourceDocument; сбой добычи контента — исключение наружу."""
+        found = extract_video_id(url)
+        if not found:
+            raise ValueError(f"не похоже на ссылку YouTube: {url}")
+        video_id = found[0]
+        transcript = self._fetch_transcript(video_id)
+        return SourceDocument(
+            canonical_id=canonical_video_id(video_id),
+            kind="video",
+            url=f"https://youtu.be/{video_id}",
+            content=transcript,
+        )

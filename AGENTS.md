@@ -21,13 +21,13 @@ docker compose up -d --build                      # прод-запуск
 
 ## Текущее состояние и направление
 
-Код — пакет `bot/` (фаза 0 миграции завершена): `config.py` (env-конфиг),
-`pipeline.py` (Deps + process_job), `discord_app.py` (события/треды),
-`jobs.py` (очередь), `analysis/` (llm, prompts), `sources/youtube.py`,
-`delivery/` (render, outbox, sender), `main.py` (композиция build_deps/main).
-`yt_summary_bot.py` — шим для совместимости запуска. Дальше — фазы 1–5
-из ARCHITECTURE.md §12 (strangler-паттерн). **Не переписывать всё сразу**:
-после каждого шага бот остаётся запускаемым, фазы маленькие.
+Код — пакет `bot/`. Реализованы фазы 0–4 архитектуры: расщепление монолита,
+SQLite (кеш отчётов, outbox, авторы, джобы, дедуп — `bot/store/`), отчёт из
+блоков с JSON-схемой LLM (`bot/analysis/report.py`), сущность автора с TTL и
+фоновой очередью (`bot/analysis/author.py`), порт источников ExtractorPort +
+Router (`bot/sources/base.py`, `bot/router.py`; YouTube — первый экстрактор).
+Дальше — фаза 5 (экстрактор статей) и 6 (сайты) из ARCHITECTURE.md §12.
+**Не переписывать всё сразу**: после каждого шага бот остаётся запускаемым.
 
 Ключевые плановые вектора (мотивация всех архитектурных решений):
 

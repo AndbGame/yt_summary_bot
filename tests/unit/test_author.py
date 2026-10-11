@@ -1,14 +1,14 @@
-"""Юнит-тесты сборщика фактов автора (фаза 3, bot/analysis/author.py).
+"""Юнит-тесты сборщика фактов автора (bot/analysis/author.py).
 
-Контракт (docs/ARCHITECTURE.md §5-§6, фаза 3):
+Контракт (docs/ARCHITECTURE.md §5-§6; MISS-путь фазы 4):
 - AuthorRef — стабильный ключ автора (platform, handle);
 - AuthorFacts — факты (name/url/description/extra) с to_dict/from_dict (кеш автора);
-- YouTubeAuthorFactsProvider.get(video_id): oEmbed
-  https://www.youtube.com/oembed?url=https://youtu.be/{id}&format=json даёт
-  author_name/author_url (handle — последний сегмент пути author_url:
-  …/channel/UCxxx -> UCxxx, /@name -> @name); описание канала — og:description
-  со страницы author_url; ЛЮБОЙ сбой сети/парса -> None (метод не бросает),
-  oEmbed-ответ без author_url -> None;
+- YouTubeAuthorFactsProvider.get_author_ref(url): oEmbed
+  https://www.youtube.com/oembed?url=<video-url>&format=json даёт author_url
+  (handle — последний сегмент пути: …/channel/UCxxx -> UCxxx, /@name -> @name);
+  ЭТО ЕДИНСТВЕННЫЙ запрос — описание канала get_author_ref не добывает, факты
+  берутся отдельно через get_channel(ref); ЛЮБОЙ сбой сети/парса -> None
+  (метод не бросает), oEmbed-ответ без author_url -> None;
 - get_channel(ref): для youtube страница https://www.youtube.com/channel/{handle}
   (UC-хэндл) или https://www.youtube.com/{handle} (@-хэндл); имя из <title>
   до " - YouTube", описание из og:description; сбой -> None.
@@ -16,8 +16,8 @@
 Сети в тестах нет: провайдер принимает fetch(url, timeout) -> (status, text) | None —
 в тестах фейк с двумя маршрутами (oEmbed / страница канала), в проде requests.
 Точный HTML/разметку не фиксируем — только контракт данных и отказов.
-Импорт bot.analysis.author — ленивый внутри тестов (TDD): пока фаза 3 не
-реализована, падает конкретный тест, а не коллекция всего прогона.
+Импорт bot.analysis.author — ленивый внутри тестов (TDD): пока фаза не
+реализована, падает конкретный тест, а не ошибкой коллекции всего прогона.
 """
 
 import json
@@ -25,9 +25,6 @@ from urllib.parse import unquote
 
 VIDEO_ID = "abcdefghijk"
 
-OG_DESCRIPTION_PAGE = (
-    '<html><head><meta property="og:description" content="Канал о программировании"></head></html>'
-)
 CHANNEL_PAGE = (
     "<html><head><title>Название канала - YouTube</title>"
     '<meta property="og:description" content="Описание канала"></head></html>'
@@ -118,77 +115,69 @@ class TestAuthorFacts:
         assert restored.extra == {"subscribers": 1000}
 
 
-class TestProviderGet:
-    def test_oembed_builds_ref_and_facts_with_channel_description(self):
-        fetch = FakeFetch(oembed=(200, _oembed_json()), page=(200, OG_DESCRIPTION_PAGE))
+class TestProviderGetAuthorRef:
+    """get_author_ref(url): ref из oEmbed по ссылке на видео; один запрос, без страницы канала."""
 
-        result = _provider(fetch).get(VIDEO_ID)
+    VIDEO_URL = f"https://youtu.be/{VIDEO_ID}"
 
-        assert result is not None, "успешный oEmbed + страница канала дают (ref, facts)"
-        ref, facts = result
+    def test_oembed_builds_ref(self):
+        fetch = FakeFetch(oembed=(200, _oembed_json()))
+
+        ref = _provider(fetch).get_author_ref(self.VIDEO_URL)
+
+        assert ref is not None, "успешный oEmbed даёт AuthorRef"
         assert ref.platform == "youtube"
         assert ref.handle == "UC1234567", "handle — последний сегмент пути /channel/UCxxx"
-        assert facts.name == "Имя Канала", "имя — author_name из oEmbed"
-        assert facts.url == "https://www.youtube.com/channel/UC1234567", "ссылка — author_url"
-        assert facts.description == "Канал о программировании", "описание — og:description канала"
 
     def test_handle_from_at_url(self):
-        fetch = FakeFetch(
-            oembed=(200, _oembed_json(author_url="https://www.youtube.com/@ivan.dev")),
-            page=(200, OG_DESCRIPTION_PAGE),
-        )
+        fetch = FakeFetch(oembed=(200, _oembed_json(author_url="https://www.youtube.com/@ivan.dev")))
 
-        result = _provider(fetch).get(VIDEO_ID)
+        ref = _provider(fetch).get_author_ref(self.VIDEO_URL)
 
-        assert result is not None
-        ref, _ = result
+        assert ref is not None
         assert ref.handle == "@ivan.dev", "handle — последний сегмент пути /@name"
 
-    def test_oembed_url_shape_and_channel_page_after_it(self):
-        fetch = FakeFetch(oembed=(200, _oembed_json()), page=(200, OG_DESCRIPTION_PAGE))
+    def test_oembed_url_contains_video_url(self):
+        fetch = FakeFetch(oembed=(200, _oembed_json()))
 
-        _provider(fetch).get(VIDEO_ID)
+        _provider(fetch).get_author_ref(self.VIDEO_URL)
 
         requested = unquote(fetch.urls[0])
         assert requested.startswith("https://www.youtube.com/oembed")
         assert f"url=https://youtu.be/{VIDEO_ID}" in requested
         assert "format=json" in requested
-        # после oEmbed запрашивается страница канала по author_url
-        assert fetch.urls[1] == "https://www.youtube.com/channel/UC1234567"
+
+    def test_only_oembed_requested_no_channel_page(self):
+        # фаза 4: ref добывается без фактов — страницу канала (и её описание)
+        # get_author_ref не трогает, факты идут через get_channel(ref)
+        fetch = FakeFetch(oembed=(200, _oembed_json()))
+
+        _provider(fetch).get_author_ref(self.VIDEO_URL)
+
+        assert len(fetch.urls) == 1, "ровно один запрос — oEmbed"
 
     def test_provider_constructs_without_fetch(self):
         # дефолтный провайдер (requests) создаётся без сети; вызовы в тесте не делаем
         assert _provider() is not None
 
     def test_oembed_404_gives_none(self):
-        assert _provider(FakeFetch(oembed=(404, None))).get(VIDEO_ID) is None
+        assert _provider(FakeFetch(oembed=(404, None))).get_author_ref(self.VIDEO_URL) is None
 
     def test_oembed_broken_json_gives_none(self):
         provider = _provider(FakeFetch(oembed=(200, "<html>не json</html>")))
-        assert provider.get(VIDEO_ID) is None
+        assert provider.get_author_ref(self.VIDEO_URL) is None
 
     def test_oembed_without_author_url_gives_none(self):
         provider = _provider(FakeFetch(oembed=(200, json.dumps({"author_name": "Имя"}))))
-        assert provider.get(VIDEO_ID) is None
+        assert provider.get_author_ref(self.VIDEO_URL) is None
 
     def test_network_failure_gives_none(self):
-        # fetch вернул None (сеть легла) — и для oEmbed, и для страницы канала
-        assert _provider(FakeFetch()).get(VIDEO_ID) is None
+        # fetch вернул None (сеть легла)
+        assert _provider(FakeFetch()).get_author_ref(self.VIDEO_URL) is None
 
     def test_fetch_exception_gives_none(self):
         # исключение внутри fetch — тоже «сбой сети», наружу не бросается
-        assert _provider(FakeFetch(raise_on_call=True)).get(VIDEO_ID) is None
-
-    def test_channel_page_404_gives_none(self):
-        # сбой страницы канала — тоже сбой get(): факты без описания не отдаём
-        provider = _provider(FakeFetch(oembed=(200, _oembed_json()), page=(404, None)))
-        assert provider.get(VIDEO_ID) is None
-
-    def test_channel_page_without_og_description_gives_none(self):
-        # нет og:description в HTML — сбой разбора, None (не facts с пустым описанием)
-        page = "<html><head><title>X - YouTube</title></head></html>"
-        provider = _provider(FakeFetch(oembed=(200, _oembed_json()), page=(200, page)))
-        assert provider.get(VIDEO_ID) is None
+        assert _provider(FakeFetch(raise_on_call=True)).get_author_ref(self.VIDEO_URL) is None
 
 
 class TestProviderGetChannel:

@@ -97,7 +97,7 @@ docker compose up -d --build
 ## Тесты и линт
 
 ```bash
-.venv/Scripts/python.exe -m pytest          # 161 тест без сети
+.venv/Scripts/python.exe -m pytest          # 379 тестов без сети
 .venv/Scripts/python.exe -m ruff check bot tests yt_summary_bot.py
 ```
 

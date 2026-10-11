@@ -1,16 +1,19 @@
-"""E2E кеша отчётов (фаза 2): повторная ссылка отвечает из SQLite-кеша мгновенно.
+"""E2E кеша отчётов (фаза 2 + джобы фазы 4): повторная ссылка отвечает из SQLite-кеша.
 
-Контракт ключа: (canonical_video_id(video_id), prompts_ver, REPORT_SCHEMA,
-content_hash), где content_hash = sha256(транскрипта).hexdigest()[:16].
-Транскрипт теперь скачивается ВСЕГДА (нужен для хэша), но попадание в кеш не
-зовёт LLM и не зовёт его повторно; payload в кеше — JSON отчёта (Report.to_json,
-читается обратно через Report.from_json). Ошибки транскрипта/LLM не кешируются;
-при НЕдоступном транскрипте отдаётся последний разбор из кеша (фолбэк по тройке
-ключей, без content_hash). Отправка/буферизация/статусы — без изменений.
+Контракт ключа: (canonical_id, prompts_ver, REPORT_SCHEMA, content_hash), где
+canonical_id джоба получает от экстрактора (фаза 4), а content_hash =
+sha256(контента).hexdigest()[:16]. Контент добывается ВСЕГДА (нужен для хэша),
+но попадание в кеш не зовёт LLM и не зовёт его повторно; payload в кеше — JSON
+отчёта (Report.to_json, читается обратно через Report.from_json). Ошибки
+контента/LLM не кешируются; при НЕдоступном контенте отдаётся последний разбор
+из кеша (фолбэк по тройке ключей, без content_hash) — и это НЕ ошибка: отчёт
+доставлен, джоба завершается успешно. Отправка/буферизация/статусы — без
+изменений.
 
 В этих тестах deps.reports — настоящий Store во временном файле: кеш проверяется
 через ReportStore.get (контракт) и переживает «перезапуск» — новый Store на том
-же файле. Дискорд/LLM/транскрипт подменены, сети нет.
+же файле. Экстрактор — FakeExtractor из conftest в deps.router, LLM/Дискорд
+подменены, сети нет.
 """
 
 import asyncio
@@ -19,50 +22,39 @@ import hashlib
 import pytest
 
 from bot.pipeline import REPORT_SCHEMA, process_job
-from bot.sources.youtube import canonical_video_id
 from bot.store.db import Store
 
 VIDEO_ID = "cachevid001"
+URL = f"https://youtu.be/{VIDEO_ID}"
+TRANSCRIPT = f"субтитры {VIDEO_ID}"
 THREAD_ID = 4242
 PROMPTS = {"version": "2", "error": "упс: {reason}"}
 
 
 def _content_hash(transcript: str) -> str:
-    """Хэш транскрипта ровно по контракту пайплайна (зеркало логики)."""
+    """Хэш контента ровно по контракту пайплайна (зеркало логики)."""
     return hashlib.sha256(transcript.encode()).hexdigest()[:16]
 
 
-def _patch_transcript_counter(monkeypatch, transcripts=None, fail_for=None):
-    """Подменяет fetch_transcript счётчиком; возвращает список скачанных video_id.
-
-    transcripts — необязательная очередь ответов (для сценария «сменился
-    транскрипт»); по умолчанию f"субтитры {video_id}".
-    """
-    calls = []
-    answers = list(transcripts) if transcripts is not None else None
-
-    def _fake(video_id):
-        calls.append(video_id)
-        if fail_for and video_id in fail_for:
-            raise fail_for[video_id]
-        if answers:
-            return answers.pop(0)
-        return f"субтитры {video_id}"
-
-    monkeypatch.setattr("bot.pipeline.fetch_transcript", _fake)
-    return calls
-
-
-def _cache_key(deps, video_id, transcript=None):
-    """Ключ кеша ровно по контракту фазы 2 (зеркало логики пайплайна)."""
-    if transcript is None:
-        transcript = f"субтитры {video_id}"
+def _cache_key(extractor, deps, url=URL, transcript=TRANSCRIPT):
+    """Ключ кеша по контракту (зеркало логики пайплайна фазы 4)."""
     return (
-        canonical_video_id(video_id),
+        extractor.canonical_id(url),
         str(deps.prompts.get("version", "0")),
         REPORT_SCHEMA,
         _content_hash(transcript),
     )
+
+
+def _job(extractor, thread_id=THREAD_ID, url=URL, **extra):
+    job = {
+        "kind": extractor.name,
+        "url": url,
+        "canonical_id": extractor.canonical_id(url),
+        "thread_id": thread_id,
+    }
+    job.update(extra)
+    return job
 
 
 @pytest.fixture
@@ -75,25 +67,26 @@ def store(tmp_path):
 
 class TestCacheMiss:
     def test_first_job_calls_llm_and_stores_report_json(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         thread = make_thread(THREAD_ID)
+        extractor = make_extractor(transcripts={URL: TRANSCRIPT})
         deps = make_deps(
             thread=thread,
             llm=make_llm(),
             prompts=dict(PROMPTS),
             reports=store.reports,
+            router=make_router([extractor]),
         )
-        fetches = _patch_transcript_counter(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps, _job(extractor)))
 
-        assert deps.llm.calls == [f"субтитры {VIDEO_ID}"], "LLM вызван ровно один раз"
-        assert fetches == [VIDEO_ID], "транскрипт скачан"
-        payload = store.reports.get(*_cache_key(deps, VIDEO_ID))
+        assert deps.llm.calls == [TRANSCRIPT], "LLM вызван ровно один раз"
+        assert extractor.extract_calls == [URL], "контент добыт экстрактором"
+        payload = store.reports.get(*_cache_key(extractor, deps))
         assert payload is not None
         # payload — JSON отчёта: разбирается обратно в Report с блоками кратко и тезисов
-        from bot.analysis.report import Report  # лениво: TDD
+        from bot.analysis.report import Report
 
         report = Report.from_json(payload)
         assert [b.kind for b in report.blocks] == ["brief", "theses"]
@@ -101,50 +94,60 @@ class TestCacheMiss:
 
 class TestCacheHit:
     def test_second_job_served_from_cache(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         thread = make_thread(THREAD_ID)
+        extractor = make_extractor(transcripts={URL: TRANSCRIPT})
         deps = make_deps(
             thread=thread,
             llm=make_llm(),
             prompts=dict(PROMPTS),
             reports=store.reports,
+            router=make_router([extractor]),
         )
-        fetches = _patch_transcript_counter(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps, _job(extractor)))
         first_sent = list(thread.sent)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps, _job(extractor)))
 
         assert len(deps.llm.calls) == 1, "повторный job не должен вызывать LLM"
-        assert fetches == [VIDEO_ID, VIDEO_ID], (
-            "транскрипт скачивается всегда (нужен для content_hash), но без LLM"
+        assert extractor.extract_calls == [URL, URL], (
+            "контент добывается всегда (нужен для content_hash), но без LLM"
         )
         assert thread.sent == first_sent * 2, "сообщения из кеша идентичны первому разу"
 
-    def test_cache_survives_restart(self, monkeypatch, make_deps, make_thread, make_llm, tmp_path):
+    def test_cache_survives_restart(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, tmp_path
+    ):
         # кеш живёт в файле БД: новый Store на том же файле (аналог перезапуска
         # процесса) отвечает из кеша — в этом смысл фазы 1
         path = str(tmp_path / "cache.sqlite3")
         thread = make_thread(THREAD_ID)
         llm = make_llm()
         prompts = dict(PROMPTS)
-        fetches = _patch_transcript_counter(monkeypatch)
+        extractor = make_extractor(transcripts={URL: TRANSCRIPT})
+        router = make_router([extractor])
 
         first = Store(path)
-        deps1 = make_deps(thread=thread, llm=llm, prompts=prompts, reports=first.reports)
-        asyncio.run(process_job(deps1, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        deps1 = make_deps(
+            thread=thread, llm=llm, prompts=prompts, reports=first.reports, router=router
+        )
+        asyncio.run(process_job(deps1, _job(extractor)))
         first_sent = list(thread.sent)
         first.close()
 
         second = Store(path)
         try:
-            deps2 = make_deps(thread=thread, llm=llm, prompts=prompts, reports=second.reports)
-            asyncio.run(process_job(deps2, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+            deps2 = make_deps(
+                thread=thread, llm=llm, prompts=prompts, reports=second.reports, router=router
+            )
+            asyncio.run(process_job(deps2, _job(extractor)))
 
             assert len(llm.calls) == 1, "после «перезапуска» LLM не вызывается снова"
-            assert fetches == [VIDEO_ID, VIDEO_ID], "LLM не зовётся, но транскрипт нужен для хэша"
+            assert extractor.extract_calls == [URL, URL], (
+                "LLM не зовётся, но контент нужен для хэша"
+            )
             assert thread.sent == first_sent * 2
         finally:
             second.close()
@@ -152,136 +155,154 @@ class TestCacheHit:
 
 class TestCacheIsolation:
     def test_other_video_is_cache_miss(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         thread = make_thread(THREAD_ID)
+        url_other = "https://youtu.be/aaaaaaaaaaa"
+        extractor = make_extractor(transcripts={URL: "субтитры первого", url_other: "субтитры второго"})
         deps = make_deps(
             thread=thread,
             llm=make_llm(),
             prompts=dict(PROMPTS),
             reports=store.reports,
+            router=make_router([extractor]),
         )
-        fetches = _patch_transcript_counter(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": "aaaaaaaaaaa", "thread_id": THREAD_ID}))
-        asyncio.run(process_job(deps, {"video_id": "bbbbbbbbbbb", "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps, _job(extractor, url=URL)))
+        asyncio.run(process_job(deps, _job(extractor, url=url_other)))
 
-        assert len(deps.llm.calls) == 2, "разные видео — оба мимо кеша"
-        assert fetches == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
-        assert store.reports.get(*_cache_key(deps, "aaaaaaaaaaa")) is not None
-        assert store.reports.get(*_cache_key(deps, "bbbbbbbbbbb")) is not None
+        assert len(deps.llm.calls) == 2, "разные источники — оба мимо кеша"
+        assert extractor.extract_calls == [URL, url_other]
+        assert store.reports.get(*_cache_key(extractor, deps, url=URL, transcript="субтитры первого")) is not None
+        assert (
+            store.reports.get(*_cache_key(extractor, deps, url=url_other, transcript="субтитры второго"))
+            is not None
+        )
 
     def test_prompts_version_change_invalidates_cache(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         thread = make_thread(THREAD_ID)
         llm = make_llm()
-        _patch_transcript_counter(monkeypatch)
+        extractor = make_extractor(transcripts={URL: TRANSCRIPT})
+        router = make_router([extractor])
 
         deps_v2 = make_deps(
             thread=thread,
             llm=llm,
             prompts={"version": "2", "error": "упс: {reason}"},
             reports=store.reports,
+            router=router,
         )
-        asyncio.run(process_job(deps_v2, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps_v2, _job(extractor)))
 
         deps_v3 = make_deps(
             thread=thread,
             llm=llm,
             prompts={"version": "3", "error": "упс: {reason}"},
             reports=store.reports,
+            router=router,
         )
-        asyncio.run(process_job(deps_v3, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps_v3, _job(extractor)))
 
         assert len(llm.calls) == 2, "новая версия промптов — обязательный промах"
         # обе версии отчёта лежат в кеше под своими ключами
-        assert store.reports.get(*_cache_key(deps_v2, VIDEO_ID)) is not None
-        assert store.reports.get(*_cache_key(deps_v3, VIDEO_ID)) is not None
+        assert store.reports.get(*_cache_key(extractor, deps_v2)) is not None
+        assert store.reports.get(*_cache_key(extractor, deps_v3)) is not None
 
-    def test_transcript_change_invalidates_cache_for_same_video(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+    def test_content_change_invalidates_cache_for_same_source(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
-        # тот же video_id, но субтитры изменились -> другой content_hash -> промах;
+        # тот же url, но контент изменился -> другой content_hash -> промах;
         # новый отчёт замещает прежний (PK в reports — тройка ключей, content_hash
         # — обычная колонка сравнения)
         thread = make_thread(THREAD_ID)
         llm = make_llm()
-        _patch_transcript_counter(
-            monkeypatch, transcripts=["первые субтитры", "обновлённые субтитры"]
+        extractor = make_extractor(transcripts={URL: "первые субтитры"})
+        router = make_router([extractor])
+
+        deps1 = make_deps(
+            thread=thread, llm=llm, prompts=dict(PROMPTS), reports=store.reports, router=router
         )
+        asyncio.run(process_job(deps1, _job(extractor)))
 
-        deps1 = make_deps(thread=thread, llm=llm, prompts=dict(PROMPTS), reports=store.reports)
-        asyncio.run(process_job(deps1, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
-
-        deps2 = make_deps(thread=thread, llm=llm, prompts=dict(PROMPTS), reports=store.reports)
-        asyncio.run(process_job(deps2, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
-
-        assert len(llm.calls) == 2, "новый транскрипт — обязательный промах при том же video_id"
-        assert store.reports.get(*_cache_key(deps2, VIDEO_ID, "обновлённые субтитры")) is not None
-        assert store.reports.get(*_cache_key(deps1, VIDEO_ID, "первые субтитры")) is None, (
-            "старый отчёт замещён записью с новым content_hash"
+        extractor.transcripts[URL] = "обновлённые субтитры"  # контент изменился
+        deps2 = make_deps(
+            thread=thread, llm=llm, prompts=dict(PROMPTS), reports=store.reports, router=router
         )
+        asyncio.run(process_job(deps2, _job(extractor)))
+
+        assert len(llm.calls) == 2, "новый контент — обязательный промах при том же url"
+        new_key = _cache_key(extractor, deps2, transcript="обновлённые субтитры")
+        old_key = _cache_key(extractor, deps1, transcript="первые субтитры")
+        assert store.reports.get(*new_key) is not None
+        assert store.reports.get(*old_key) is None, "старый отчёт замещён записью с новым content_hash"
 
 
 class TestErrorsNotCached:
     def test_llm_failure_is_not_cached(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         thread = make_thread(THREAD_ID)
+        extractor = make_extractor(transcripts={URL: TRANSCRIPT})
         deps = make_deps(
             thread=thread,
             llm=make_llm(error=RuntimeError("LLM недоступна")),
             prompts=dict(PROMPTS),
             reports=store.reports,
+            router=make_router([extractor]),
         )
-        _patch_transcript_counter(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _job(extractor)))
 
         assert len(thread.sent) == 1, "пользователь получил сообщение об ошибке"
-        assert store.reports.get(*_cache_key(deps, VIDEO_ID)) is None, "ошибка не кешируется"
+        assert store.reports.get(*_cache_key(extractor, deps)) is None, "ошибка не кешируется"
 
-    def test_transcript_failure_is_not_cached(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+    def test_extraction_failure_is_not_cached(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         # кеш пуст: фолбэк взять неоткуда — обычная error-ветка
         thread = make_thread(THREAD_ID)
+        extractor = make_extractor(extract_error=RuntimeError("нет субтитров"))
         deps = make_deps(
             thread=thread,
             llm=make_llm(),
             prompts=dict(PROMPTS),
             reports=store.reports,
+            router=make_router([extractor]),
         )
-        _patch_transcript_counter(monkeypatch, fail_for={VIDEO_ID: RuntimeError("нет субтитров")})
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _job(extractor)))
 
         assert len(thread.sent) == 1
         assert "упс" in thread.sent[0], "пустой кеш — обычное error-сообщение"
-        assert store.reports.get(*_cache_key(deps, VIDEO_ID)) is None, "ошибка не кешируется"
+        assert store.reports.get(*_cache_key(extractor, deps)) is None, "ошибка не кешируется"
 
 
-class TestTranscriptUnavailableFallback:
-    """Субтитры исчезли (fetch_transcript падает) — отдаём последний разбор из кеша.
+class TestContentUnavailableFallback:
+    """Контент исчез (extract падает) — отдаём последний разбор из кеша.
 
     Фолбэк ищет запись по тройке (canonical, prompts_ver, schema) с ЛЮБЫМ
-    content_hash: свежий хэш посчитать не из чего, субтитров больше нет.
+    content_hash: свежий хэш посчитать не из чего, контента больше нет.
     Трейд-офф «свежесть vs доступность» зафиксирован комментарием в pipeline.py.
     """
 
-    def test_transcript_failure_serves_latest_cache_report(
-        self, monkeypatch, make_deps, make_thread, make_llm, store
+    def test_extraction_failure_serves_latest_cache_report(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
         thread = make_thread(THREAD_ID)
+        extractor = make_extractor()
         deps = make_deps(
             thread=thread,
             llm=make_llm(),
             prompts=dict(PROMPTS),
             reports=store.reports,
+            router=make_router([extractor]),
         )
-        # в кеше лежит разбор под content_hash ПРЕЖНИХ (теперь недоступных) субтитров
-        from bot.analysis.report import Report  # лениво: TDD
+        # в кеше лежит разбор под content_hash ПРЕЖНЕГО (теперь недоступного) контента
+        from bot.analysis.report import Report
 
         cached_payload = Report.from_analysis(
             {
@@ -293,15 +314,15 @@ class TestTranscriptUnavailableFallback:
             }
         ).to_json()
         store.reports.put(
-            canonical_video_id(VIDEO_ID),
+            extractor.canonical_id(URL),
             str(deps.prompts.get("version", "0")),
             REPORT_SCHEMA,
             cached_payload,
             content_hash=_content_hash("прежние субтитры"),
         )
-        _patch_transcript_counter(monkeypatch, fail_for={VIDEO_ID: RuntimeError("нет субтитров")})
+        extractor.extract_error = RuntimeError("нет субтитров")  # контент стал недоступен
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": THREAD_ID}))
+        asyncio.run(process_job(deps, _job(extractor)))
 
         assert deps.llm.calls == [], "LLM не вызывается — отчёт из кеша"
         assert thread.sent, "пользователь получил сообщения"
@@ -311,7 +332,7 @@ class TestTranscriptUnavailableFallback:
         assert "тезис из кеша" in sent_text
         # кеш не перезаписан: запись с прежним content_hash осталась последней
         assert (
-            store.reports.get_latest(canonical_video_id(VIDEO_ID), "2", REPORT_SCHEMA)
+            store.reports.get_latest(extractor.canonical_id(URL), "2", REPORT_SCHEMA)
             == cached_payload
         )
 

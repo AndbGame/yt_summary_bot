@@ -1,22 +1,32 @@
-"""Пайплайн задачи: субтитры -> кеш/LLM (JSON-отчёт) -> прогрессивный рендер -> тред.
+"""Пайплайн задачи: extract (порт экстракторов) -> кеш/LLM (JSON-отчёт) ->
+прогрессивный рендер -> тред.
 
-Ядро без глобалов: всё внешнее (Discord, LLM, буфер, кеш отчётов) приходит через
-Deps — явные порты вместо монолитных глобалов; единственная точка подмены в
-тестах — модульная функция fetch_transcript (monkeypatch bot.pipeline.fetch_transcript).
+Ядро без глобалов и без знаний о платформах: всё внешнее (Discord, LLM, буфер,
+кеш отчётов, экстракторы) приходит через Deps — джоба несёт kind/url/canonical_id,
+контент добывает экстрактор из deps.router по kind (extract -> SourceDocument).
+Единственная сеть в ядре — за портом экстрактора и LLM.
 
 Отчёт доставляется по сообщениям (кратко -> тезисы -> разделы), каждое отдельно
 проходит format_for_discord (LLM мог нарушить запрет таблиц) и чанк-сплит; при
 сбое отправки в персистентный буфер уходит ПОЛНЫЙ хвост отчёта — остаток чанков
 текущего сообщения плюс все последующие сообщения, — порядок доставки сохраняется.
 
-Субтитры могли исчезнуть с YouTube: при ошибке скачивания отдаём последний
-разбор этого видео из кеша (любой content_hash), без кеша — error-сообщение.
+Контент мог исчезнуть у источника: при ошибке extract'а отдаём последний разбор
+этого источника из кеша (любой content_hash), без кеша — error-сообщение. Ошибка
+extract/LLM теперь не глотается: process_job сначала информирует пользователя
+(error-сообщение), закрывает статус (только если доставка прошла — при
+буферизации статус остаётся до досылки хвоста), затем ПРОБРАСЫВАЕТ исключение —
+llm_worker помечает джобу failed в БД (mark_failed), и она не повторяется после
+рестарта.
 
-Обзор автора (фаза 3) строится только на промахе кеша: провайдер фактов ->
-свежая строка кеша авторов либо review_author; блок добавляется в отчёт до
-кеширования. На попадании автор-блок берётся из payload как есть, а устаревшая
-или отсутствующая строка автора даёт фоновую задачу обновления — пользователь
-никогда не ждёт фона. Любой сбой автор-пути не роняет джобу.
+Обзор автора (фазы 3-4) строится только на промахе кеша: провайдер даёт
+AuthorRef по url (get_author_ref), затем кеш авторов читается ДО сети —
+свежая строка отдаёт обзор сразу, без страницы канала и LLM; иначе факты
+канала добывает провайдер (get_channel) и обзор строит LLM (review_author);
+блок добавляется в отчёт до кеширования. На попадании автор-блок берётся из
+payload как есть, а устаревшая или отсутствующая строка автора даёт фоновую
+задачу обновления — пользователь никогда не ждёт фона. Любой сбой автор-пути
+не роняет джобу.
 """
 
 import asyncio
@@ -29,14 +39,13 @@ from typing import Any
 
 import discord
 
-from bot.analysis.author import facts_to_dict
+from bot.analysis.author import AuthorFacts, facts_to_dict
 from bot.analysis.prompts import load_prompts
 from bot.analysis.report import Report, ReportBlock, render_report_messages, validate_budgets
 from bot.config import BotConfig
 from bot.delivery.outbox import OutboxPort
 from bot.delivery.render import format_for_discord, truncate_message
 from bot.delivery.sender import SafeSender, resolve_channel
-from bot.sources.youtube import canonical_video_id, fetch_transcript
 
 log = logging.getLogger("yt-summary")
 
@@ -51,9 +60,9 @@ _ERROR_TEMPLATE = "Не смог сделать разбор этого виде
 class Deps:
     """Явные зависимости пайплайна (вместо глобалов монолита); в тестах — фейки.
 
-    Поля фазы 3 могут быть None (None-безопасность): без провайдера фактов или
-    хранилища авторов автор-путь просто пропускается, отчёт доставляется без
-    обзора автора.
+    Поля фаз 3-4 могут быть None (None-безопасность): без провайдера фактов или
+    хранилища авторов автор-путь просто пропускается; без jobs/dedup исходы
+    джоб и дедуп не фиксируются (поведение фазы 3).
     """
 
     config: BotConfig
@@ -70,11 +79,15 @@ class Deps:
     authors: Any = None  # AuthorStore | фейк из conftest
     background_queue: Any = None  # asyncio.Queue задач {"platform", "handle"}
     llm_lock: Any = None  # asyncio.Lock | None — сериализация LLM-вызовов
+    # фаза 4: реестр экстракторов (Router), задачи и дедуп сообщений в БД
+    router: Any = None  # bot.router.Router | фейк из conftest
+    jobs: Any = None  # JobStore | фейк из conftest — исходы джоб в БД
+    dedup: Any = None  # DedupStore | фейк из conftest — дедуп по message_id
 
 
-def _content_hash(transcript: str) -> str:
-    """Хэш субтитров — четвёртая часть ключа кеша (короткий, для читаемости ключа)."""
-    return hashlib.sha256(transcript.encode("utf-8")).hexdigest()[:16]
+def _content_hash(content: str) -> str:
+    """Хэш контента — четвёртая часть ключа кеша (короткий, для читаемости ключа)."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
 async def llm_call(deps: "Deps", method: str, arg) -> Any:
@@ -111,33 +124,50 @@ def _author_ttl_seconds(deps: "Deps") -> int:
     return deps.config.author_ttl_days * 86400
 
 
-async def _attach_author_block(
-    deps: "Deps", report: Report, video_id: str, prompts_ver: str, budgets: dict | None
-) -> None:
-    """MISS-путь автора: факты -> свежая строка кеша или review_author.
+def _author_facts_from_row(row) -> AuthorFacts:
+    """Факты для автор-блока из строки кеша авторов (свежая строка спасает без сети).
 
-    Блок добавляется в отчёт ДО кеширования — в кеш попадает отчёт уже с
-    автором. Любой сбой пути (фактов нет, обзор не вышел, кеш автора упал)
-    оставляет отчёт без автора: доставка разбора не должна зависеть от обзора
-    автора.
+    display_name — имя канала, url достаётся из facts_json через
+    AuthorFacts.from_dict. Битый facts_json не роняет джобу: недостающие
+    поля остаются пустыми строками.
+    """
+    try:
+        stored = AuthorFacts.from_dict(json.loads(row.get("facts_json") or "{}"))
+    except (TypeError, ValueError):
+        stored = AuthorFacts()
+    return AuthorFacts(name=row.get("display_name") or stored.name, url=stored.url)
+
+
+async def _attach_author_block(
+    deps: "Deps", report: Report, url: str, prompts_ver: str, budgets: dict | None
+) -> None:
+    """MISS-путь автора: ref по url -> кеш авторов -> (мимо кеша) факты -> обзор.
+
+    Кеш автора читается ДО сети: свежая строка отдаёт обзор как записан — без
+    get_channel (страница канала качается только когда кеш автора не спасает)
+    и без LLM, факты для блока собираются из строки. Иначе факты канала
+    добывает провайдер, обзор — review_author. Блок добавляется в отчёт ДО
+    кеширования — в кеш попадает отчёт уже с автором. Любой сбой пути (ref'а
+    нет, фактов нет, обзор не вышел, кеш автора упал) оставляет отчёт без
+    автора: доставка разбора не должна зависеть от обзора автора.
     """
     provider = getattr(deps, "author_facts", None)
     authors = getattr(deps, "authors", None)
     if provider is None:
         return
     try:
-        fetched = await asyncio.to_thread(provider.get, video_id)
+        ref = await asyncio.to_thread(provider.get_author_ref, url)
     except Exception as e:
-        log.warning("факты автора не получены (%s): %s", video_id, e)
+        log.warning("ref автора не получен (%s): %s", url, e)
         return
-    if not fetched:
+    if ref is None:
         return
-    ref, facts = fetched
     platform = getattr(ref, "platform", "") or ""
     handle = getattr(ref, "handle", "") or ""
     if not handle:
         return
 
+    # кеш автора — ДО сети: свежая строка спасает без страницы канала и LLM
     try:
         row = authors.get(platform, handle) if authors is not None else None
         fresh = bool(row) and bool(row.get("review_json")) and authors.is_fresh(
@@ -148,20 +178,30 @@ async def _attach_author_block(
         # строка считается отсутствующей, обзор строится в LLM как на промахе
         log.warning("кеш автора недоступен (%s/%s): %s", platform, handle, e)
         row, fresh = None, False
+
     if fresh:
-        # свежая строка кеша: LLM не зовётся, обзор берётся как записан
+        # свежая строка кеша: обзор берётся как записан, факты — из строки
         review = row["review_json"]
+        facts = _author_facts_from_row(row)
     else:
+        try:
+            facts = await asyncio.to_thread(provider.get_channel, ref)
+        except Exception as e:
+            log.warning("факты автора не получены (%s): %s", url, e)
+            return
+        if facts is None:
+            return
         try:
             review = await llm_call(deps, "review_author", facts)
         except Exception as e:
-            log.warning("обзор автора не вышел (%s): %s", video_id, e)
+            log.warning("обзор автора не вышел (%s): %s", url, e)
             return
+
     report.blocks.append(_author_block(ref, facts, review))
     # бюджет author-блока проверяется отдельно: блок появляется уже после общей
     # валидации отчёта в process_job (превышение не фатально, рендер укоротит)
     for warning in validate_budgets(Report([report.blocks[-1]]), budgets):
-        log.warning("%s: %s", video_id, warning)
+        log.warning("%s: %s", url, warning)
     if fresh:
         return
 
@@ -211,89 +251,14 @@ def _queue_stale_author_refresh(deps: "Deps", report: Report) -> None:
     queue.put_nowait({"platform": platform, "handle": handle})
 
 
-async def process_job(deps: Deps, job: dict) -> None:
-    """Полный цикл: субтитры -> кеш/LLM -> рендер -> отправка в тред."""
-    video_id = job["video_id"]
-    thread = await resolve_channel(deps.client, job["thread_id"])
-    if thread is None:
-        log.error("тред %s недоступен, задача %s отброшена", job["thread_id"], video_id)
-        return
+async def _deliver(deps: "Deps", thread, messages: list[str], label: str) -> bool:
+    """Отправляет сообщения треду; при сбое буферизует ПОЛНЫЙ хвост отчёта.
 
-    status = job.get("status")
-    link = f"https://youtu.be/{video_id}"
-
-    try:
-        # промпты могут быть не заданы (обратная совместимость) — лениво читаем
-        # с диска; версия промптов и бюджеты берутся из одного словаря
-        prompts = deps.prompts
-        if prompts is None:
-            prompts = load_prompts()
-        prompts_ver = str(prompts.get("version", "0"))
-        budgets = prompts.get("budgets")
-
-        # субтитры скачиваются ВСЕГДА: content_hash считается из них даже при
-        # попадании в кеш (изменившиеся субтитры должны дать новый отчёт)
-        canonical = canonical_video_id(video_id)
-        try:
-            transcript = await asyncio.to_thread(fetch_transcript, video_id)
-        except Exception as fetch_err:
-            # Трейд-офф «свежесть vs доступность» — осознанно отдаём возможное
-            # устаревшее: субтитры могли исчезнуть с YouTube навсегда, и тогда без
-            # фолбэка пользователь не получит ничего, хотя разбор этого видео уже
-            # лежит в кеше под прежним content_hash (свежий хэш посчитать не из чего).
-            cached = deps.reports.get_latest(canonical, prompts_ver, REPORT_SCHEMA)
-            if cached is None:
-                raise
-            log.info("субтитры недоступны, отдаю прошлый разбор из кеша: %s", fetch_err)
-            report = Report.from_json(cached)
-        else:
-            content_hash = _content_hash(transcript)
-            payload = deps.reports.get(canonical, prompts_ver, REPORT_SCHEMA, content_hash)
-            if payload is not None:
-                log.info("разбор из кеша: %s", video_id)
-                report = Report.from_json(payload)
-                # HIT: автор-блок из payload, провайдер и LLM не трогаются;
-                # строка автора устарела или отсутствует — обновление в фоне
-                _queue_stale_author_refresh(deps, report)
-            else:
-                report = await llm_call(deps, "analyze_content", transcript)
-                if not report.blocks:
-                    # пустой отчёт нельзя ни кешировать, ни отправлять: пользователь
-                    # останется без сообщений с висящим статусом
-                    raise RuntimeError("LLM вернул пустой отчёт")
-                # превышение бюджета не фатально: рендер укоротит блок, но в логе
-                # остаётся след для настройки промптов
-                for warning in validate_budgets(report, budgets):
-                    log.warning("%s: %s", video_id, warning)
-                # MISS: автор-блок строится до кеширования — в кеш попадает
-                # отчёт уже с автором
-                await _attach_author_block(deps, report, video_id, prompts_ver, budgets)
-                # в кеш кладём только успешный разбор: ошибки транскрипта/LLM
-                # повторно разберутся на следующей попытке
-                deps.reports.put(canonical, prompts_ver, REPORT_SCHEMA, report.to_json(), content_hash)
-
-        messages = render_report_messages(report, link, budgets=budgets)
-        if messages:
-            # заголовок разбора — только в первом сообщении (рендер про ссылку-источник не знает)
-            messages[0] = f"**Разбор: {link}**\n\n{messages[0]}"
-    except Exception as e:
-        log.warning("разбор не вышел (%s): %s", video_id, e)
-        prompts = deps.prompts
-        if prompts is None:
-            # промпты не переданы в Deps: ленивое чтение с диска — один раз,
-            # выше, для ключа кеша; при заданном deps.prompts error-ветка
-            # диск не читает (шаблон берётся из памяти)
-            prompts = load_prompts()
-        # LLM/провайдер могут вернуть текст с mention — не позволяем боту тегать
-        # людей: @everyone/@here и начало <@-пинга вырезаются из причины ошибки
-        reason = re.sub(r"@everyone|@here|<@", "", str(e))
-        error_text = prompts.get("error", _ERROR_TEMPLATE).format(reason=reason)
-        messages = [f"**Разбор: {link}**\n\n{error_text}"]
-
-    # отправка: каждое сообщение — свои чанки; чанки всех сообщений предвычислены
-    # заранее, чтобы при сбое буферизовать ПОЛНЫЙ хвост отчёта одним проходом
-    # (остаток текущего сообщения + все последующие сообщения): иначе сбой в
-    # середине навсегда терял бы конец разбора; порядок доставки сохраняется
+    Чанки всех сообщений предвычислены заранее, чтобы при сбое одним проходом
+    буферизовать остаток текущего сообщения плюс все последующие: иначе сбой
+    в середине навсегда терял бы конец разбора; порядок доставки сохраняется.
+    True — всё доставлено; False — Discord недоступен, хвост в outbox.
+    """
     chunks_per_message = [
         truncate_message(format_for_discord(message), deps.config.split_threshold)[
             : deps.config.max_split_messages
@@ -311,12 +276,127 @@ async def process_job(deps: Deps, job: dict) -> None:
             tail = chunks[idx:] + [c for later in chunks_per_message[i + 1 :] for c in later]
             for buffered in tail:
                 deps.outbox.append(thread.id, buffered)
-            log.warning("%s: буферизовано %d чанков (Discord недоступен)", video_id, len(tail))
-            return
+            log.warning("%s: буферизовано %d чанков (Discord недоступен)", label, len(tail))
+            return False
+    log.info("готово: %s (%d сообщений, %d чанков)", label, len(messages), delivered)
+    return True
 
-    if status:
+
+async def _close_status(status) -> None:
+    """Закрывает статусное сообщение («готово»/ошибка уже доставлены в тред)."""
+    if not status:
+        return
+    try:
+        await status.delete()
+    except discord.HTTPException:
+        pass
+
+
+async def process_job(deps: Deps, job: dict) -> None:
+    """Полный цикл: extract -> кеш/LLM -> рендер -> отправка в тред.
+
+    Контракт исхода джобы (фаза 4): успех и «тред недоступен» возвращаются
+    штатно (воркер поставит mark_done), любой сбой разбора пробрасывается
+    ПОСЛЕ доставки error-сообщения и закрытия статуса (воркер поставит
+    mark_failed — джоба не повторится после рестарта, ошибка уже показана).
+    """
+    url = job["url"]
+    canonical = job["canonical_id"]
+    extractor = deps.router.by_name(job["kind"])
+    thread = await resolve_channel(deps.client, job["thread_id"])
+    if thread is None:
+        log.error("тред %s недоступен, задача %s отброшена", job["thread_id"], url)
+        return
+
+    status = job.get("status")
+    link = url
+
+    try:
+        if extractor is None:
+            # kind джобы нет в реестре (экстрактор убрали из build_deps, джоба
+            # из старой версии): человеческий текст вместо AttributeError на
+            # None.extract — попадает в error-путь ниже (сообщение пользователю,
+            # закрытие статуса, проброс — воркер пометит джобу failed)
+            raise RuntimeError(f"неизвестный тип источника: {job['kind']}")
+
+        # промпты могут быть не заданы (обратная совместимость) — лениво читаем
+        # с диска; версия промптов и бюджеты берутся из одного словаря
+        prompts = deps.prompts
+        if prompts is None:
+            prompts = load_prompts()
+        prompts_ver = str(prompts.get("version", "0"))
+        budgets = prompts.get("budgets")
+
+        # контент добывается ВСЕГДА: content_hash считается из него даже при
+        # попадании в кеш (изменившийся контент должен дать новый отчёт)
+        doc = None
         try:
-            await status.delete()
-        except discord.HTTPException:
-            pass
-    log.info("готово: %s (%d сообщений, %d чанков)", video_id, len(messages), delivered)
+            doc = await asyncio.to_thread(extractor.extract, url)
+        except Exception as extract_err:
+            # Трейд-офф «свежесть vs доступность» — осознанно отдаём возможное
+            # устаревшее: контент мог исчезнуть у источника навсегда, и тогда без
+            # фолбэка пользователь не получит ничего, хотя разбор уже лежит в
+            # кеше под прежним content_hash (свежий хэш посчитать не из чего).
+            cached = deps.reports.get_latest(canonical, prompts_ver, REPORT_SCHEMA)
+            if cached is None:
+                raise
+            log.info("контент недоступен, отдаю прошлый разбор из кеша: %s", extract_err)
+            report = Report.from_json(cached)
+        else:
+            link = doc.url  # ссылка для рендера — нормализованная форма экстрактора
+            content_hash = _content_hash(doc.content)
+            payload = deps.reports.get(canonical, prompts_ver, REPORT_SCHEMA, content_hash)
+            if payload is not None:
+                log.info("разбор из кеша: %s", canonical)
+                report = Report.from_json(payload)
+                # HIT: автор-блок из payload, провайдер и LLM не трогаются;
+                # строка автора устарела или отсутствует — обновление в фоне
+                _queue_stale_author_refresh(deps, report)
+            else:
+                report = await llm_call(deps, "analyze_content", doc.content)
+                if not report.blocks:
+                    # пустой отчёт нельзя ни кешировать, ни отправлять: пользователь
+                    # останется без сообщений с висящим статусом
+                    raise RuntimeError("LLM вернул пустой отчёт")
+                # превышение бюджета не фатально: рендер укоротит блок, но в логе
+                # остаётся след для настройки промптов
+                for warning in validate_budgets(report, budgets):
+                    log.warning("%s: %s", canonical, warning)
+                # MISS: автор-блок строится до кеширования — в кеш попадает
+                # отчёт уже с автором
+                await _attach_author_block(deps, report, url, prompts_ver, budgets)
+                # в кеш кладём только успешный разбор: ошибки extract/LLM
+                # повторно разберутся на следующей попытке
+                deps.reports.put(canonical, prompts_ver, REPORT_SCHEMA, report.to_json(), content_hash)
+
+        messages = render_report_messages(report, link, budgets=budgets)
+        if messages:
+            # заголовок разбора — только в первом сообщении (рендер про ссылку-источник не знает)
+            messages[0] = f"**Разбор: {link}**\n\n{messages[0]}"
+    except Exception as e:
+        log.warning("разбор не вышел (%s): %s", canonical, e)
+        prompts = deps.prompts
+        if prompts is None:
+            # промпты не переданы в Deps: ленивое чтение с диска — один раз,
+            # выше, для ключа кеша; при заданном deps.prompts error-ветка
+            # диск не читает (шаблон берётся из памяти)
+            prompts = load_prompts()
+        # LLM/провайдер могут вернуть текст с mention — не позволяем боту тегать
+        # людей: @everyone/@here и начало <@-пинга вырезаются из причины ошибки
+        reason = re.sub(r"@everyone|@here|<@", "", str(e))
+        error_text = prompts.get("error", _ERROR_TEMPLATE).format(reason=reason)
+        delivered = await _deliver(
+            deps, thread, [f"**Разбор: {link}**\n\n{error_text}"], canonical
+        )
+        # джоба упала: статус закрываем ТОЛЬКО если error-сообщение доставлено —
+        # при буферизации оно остаётся (симметрично success-ветке: досылка хвоста
+        # из outbox продолжит разбор в треде). Пробрасываем исключение —
+        # llm_worker запишет mark_failed в БД
+        if delivered:
+            await _close_status(status)
+        raise
+
+    if await _deliver(deps, thread, messages, canonical):
+        # статус закрывается только после полной доставки; при буферизации он
+        # остаётся: досылка хвоста из outbox продолжит разбор в треде
+        await _close_status(status)

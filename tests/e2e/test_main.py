@@ -44,6 +44,19 @@ def test_build_deps_wires_real_components(tmp_path):
     assert isinstance(deps.client, discord.Client)
     assert isinstance(deps.queue, asyncio.Queue)
 
+    # фаза 4: роутер с YouTube-экстрактором за портом, задачи и дедуп — репозитории БД
+    from bot.router import Router
+    from bot.sources.youtube import YoutubeExtractor
+    from bot.store.dedup import DedupStore
+    from bot.store.jobs import JobStore
+
+    assert isinstance(deps.router, Router)
+    assert isinstance(deps.router.by_name("video"), YoutubeExtractor), (
+        "YouTube — первый экстрактор в реестре роутера"
+    )
+    assert isinstance(deps.jobs, JobStore)
+    assert isinstance(deps.dedup, DedupStore)
+
 
 def test_main_exits_without_required_config(monkeypatch):
     # подменяем BotConfig в обоих модулях: независимо от того, как main его импортирует

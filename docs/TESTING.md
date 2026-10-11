@@ -50,6 +50,11 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/unit/test_author.py` | AuthorRef/AuthorFacts, провайдер: oEmbed/og:description, все сбои → None, URL-форматы UC/@ | `bot/analysis/author.py` |
 | `tests/unit/test_author_store.py` | authors-таблица: roundtrip, PK, миграция v2→v3, is_fresh TTL-границы | `bot/store/authors.py` |
 | `tests/e2e/test_author_flow.py` | автор-путь: MISS (факты→обзор→блок в кеш), HIT без сети, устаревший → фон, дедуп refresh, llm_lock не даёт пересечений analyze×review, деградация при сбое кеша автора | `bot/pipeline.py`, `bot/jobs.py` |
+| `tests/unit/test_sources_base.py` | SourceDocument, ExtractorPort (find — основной, инвариант find⇒canonical_id) | `bot/sources/base.py` |
+| `tests/unit/test_router.py` | Route-границы, приоритет реестра, by_name, не-ссылка → None | `bot/router.py` |
+| `tests/unit/test_jobs_store.py` | jobs-таблица: put/take_new FIFO/mark_done/mark_failed, unicode payload | `bot/store/jobs.py` |
+| `tests/unit/test_dedup_store.py` | дедуп по message_id: True/False, персистентность | `bot/store/dedup.py` |
+| `tests/e2e/test_recovery.py` | восстановление джоб после рестарта: attach статуса, state=done/failed, полный цикл | `bot/discord_app.py`, `bot/jobs.py` |
 
 ## E2E in-process: как устроено
 
@@ -60,9 +65,8 @@ live-smoke вручную. Всё остальное — быстрые дете
 - `fetch_transcript` / `summarize` / `_resolve_channel` — monkeypatch на модуль.
 
 Проверяется **пользовательски видимое**: какие сообщения, в каком порядке,
-какой длины, с какой разметкой. Сегодня monkeypatch глобалов — вынужденный
-шаг (модуль монолитен); фаза 0 архитектуры заменяет его на явные порты,
-и фейки переезжают в `conftest.py` как фикстуры.
+какой длины, с какой разметкой. Внешние зависимости идут через порты (Router,
+инжект-фейки провайдера/экстрактора), LLM подменяется в conftest-фейках.
 
 Ключевые e2e-сценарии (расширяются по фазам миграции):
 

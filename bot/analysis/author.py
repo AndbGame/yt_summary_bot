@@ -1,15 +1,18 @@
 """Факты об авторе YouTube-канала: oEmbed + страница канала, без LLM.
 
 AuthorRef — стабильный ключ автора (platform, handle), AuthorFacts — что о нём
-известно (ARCHITECTURE.md §5). Провайдер собирает факты в два запроса:
-oEmbed по видео даёт имя и ссылку канала (handle — последний сегмент пути),
-страница канала — описание из og:description. Обзор по этим фактам делает LLM
-(bot/analysis/llm.py), а не провайдер.
+известно (ARCHITECTURE.md §5). Провайдер разделяет два шага (фаза 4):
+get_author_ref(url) даёт ref по ОДНОМУ oEmbed-запросу к видео (handle —
+последний сегмент пути author_url), факты канала собирает отдельно
+get_channel(ref): страница канала качается только когда кеш автора не
+спасает — пайплайн сначала смотрит в кеш авторов, и лишь на устаревшей или
+отсутствующей строке зовёт get_channel.
+Обзор по фактам делает LLM (bot/analysis/llm.py), а не провайдер.
 
 Отказная стойкость: ЛЮБОЙ сбой сети/парса — None, метод не бросает. Неполные
-факты (есть имя, нет описания) тоже считаются сбоем: обзор по половине фактов
-хуже отсутствия блока. Сеть изолирована за fetch(url, timeout) ->
-(status, text) | None — в тестах фейк, в проде requests.
+факты (есть имя, нет описания) в get_channel тоже считаются сбоем: обзор по
+половине фактов хуже отсутствия блока. Сеть изолирована за fetch(url, timeout)
+-> (status, text) | None — в тестах фейк, в проде requests.
 """
 
 import html
@@ -113,26 +116,29 @@ class YouTubeAuthorFactsProvider:
         # подмена на уровне инстанса, глобальное состояние не трогаем
         self._fetch = fetch or _DEFAULT_FETCH
 
-    def get(self, video_id: str) -> tuple[AuthorRef, AuthorFacts] | None:
-        """Факты по видео: oEmbed -> (ref, facts) с описанием канала; сбой — None.
+    def get_author_ref(self, url: str) -> AuthorRef | None:
+        """AuthorRef по ссылке на контент: один oEmbed-запрос; сбой — None.
 
-        Строгий режим: без описания канала факты НЕ отдаются (None) — MISS-путь
-        пайплайна по этому решает, строить ли обзор, а обзор по половине фактов
-        хуже отсутствия блока.
+        MISS-путь пайплайна (фаза 4): ref добывается БЕЗ страницы канала —
+        единственный запрос это oEmbed по url; oEmbed-ответ без author_url,
+        как и любой сбой сети/парса, даёт None (метод не бросает). Факты —
+        отдельный шаг через get_channel(ref).
         """
         try:
-            return self._get(video_id)
+            return self._get_author_ref(url)
         except Exception:
-            log.warning("факты автора для видео %s не получены", video_id, exc_info=True)
+            log.warning("ref автора для %s не получен", url, exc_info=True)
             return None
 
     def get_channel(self, ref: AuthorRef) -> AuthorFacts | None:
-        """Факты по каналу (фоновое обновление); сбой сети/парса — None.
+        """Факты по каналу (MISS-путь пайплайна и фоновое обновление); сбой — None.
 
-        Терпимый режим, асимметрично с get(): имя обязательно (без него обзор
-        не о ком писать), а описание опционально (пустая строка) — фоновое
-        обновление не должно пропадать из-за временно пустого og:description,
-        строка кеша всё равно перезапишется целиком.
+        Страница канала качается только когда кеш автора не спасает: пайплайн
+        зовёт этот шаг лишь на устаревшей или отсутствующей строке кеша (а
+        фоновый воркер — на задачах обновления). Терпимый режим: имя
+        обязательно (без него обзор не о ком писать), описание опционально
+        (пустая строка) — обновление не должно пропадать из-за временно
+        пустого og:description, строка кеша всё равно перезапишется целиком.
         """
         try:
             return self._get_channel(ref)
@@ -145,9 +151,9 @@ class YouTubeAuthorFactsProvider:
             )
             return None
 
-    def _get(self, video_id: str) -> tuple[AuthorRef, AuthorFacts] | None:
+    def _get_author_ref(self, url: str) -> AuthorRef | None:
         fetched = self._fetch(
-            f"{_OEMBED_URL}?{urlencode({'url': f'https://youtu.be/{video_id}', 'format': 'json'})}",
+            f"{_OEMBED_URL}?{urlencode({'url': url, 'format': 'json'})}",
             _TIMEOUT,
         )
         if fetched is None:
@@ -167,16 +173,7 @@ class YouTubeAuthorFactsProvider:
         handle = _handle_from_url(author_url)
         if not handle:
             return None
-        description = self._channel_description(author_url)
-        if description is None:
-            # oEmbed без страницы канала — неполные факты: обзор по ним не строим
-            return None
-        facts = AuthorFacts(
-            name=str(data.get("author_name", "") or ""),
-            url=author_url,
-            description=description,
-        )
-        return AuthorRef(platform="youtube", handle=handle), facts
+        return AuthorRef(platform="youtube", handle=handle)
 
     def _get_channel(self, ref: AuthorRef) -> AuthorFacts | None:
         if getattr(ref, "platform", "") != "youtube":
@@ -197,12 +194,6 @@ class YouTubeAuthorFactsProvider:
         if name is None:
             return None
         return AuthorFacts(name=name, url=url, description=_og_description(page) or "")
-
-    def _channel_description(self, url: str) -> str | None:
-        page = self._page(url)
-        if page is None:
-            return None
-        return _og_description(page)
 
     def _page(self, url: str) -> str | None:
         """HTML страницы канала: только 2xx считаются успехом, остальное — None."""

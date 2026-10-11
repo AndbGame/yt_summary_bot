@@ -1,13 +1,18 @@
-"""E2E-тесты in-process: полный путь «job -> субтитры -> LLM (JSON-отчёт) ->
-прогрессивный рендер -> тред/буфер» без сети — fetch_transcript и LLM подменены,
+"""E2E-тесты in-process: полный путь «job -> extract -> LLM (JSON-отчёт) ->
+прогрессивный рендер -> тред/буфер» без сети — экстрактор и LLM подменены,
 Discord-объекты — фейки из conftest.
 
-Фаза 2: LLM отвечает JSON-структурой, пайплайн отправляет отчёт ПОСООБЩЕНИЯМ
-(кратко -> тезисы -> подробно по разделам); первое сообщение несёт заголовок
-«**Разбор: <ссылка>**», каждое сообщение отдельно режется чанк-сплиттером
-(fence-aware, (i/N) внутри одного сообщения); при сбое отправки в персистентный
-буфер уходит ПОЛНЫЙ хвост отчёта: остаток чанков текущего сообщения плюс ВСЕ
-последующие сообщения — конец разбора не теряется.
+Фаза 4: пайплайн не знает про YouTube — джоба несёт kind/url/canonical_id,
+контент добывает экстрактор из deps.router (extract -> SourceDocument, контент
+в doc.content), canonical_id берётся из джобы, ссылка для рендера — doc.url.
+monkeypatch bot.pipeline.fetch_transcript больше не нужен: контент подменяется
+фейк-экстрактором в роутере. LLM отвечает JSON-структурой, отчёт отправляется
+ПОСООБЩЕНИЯМ (кратко -> тезисы -> подробно по разделам); при сбое отправки в
+персистентный буфер уходит ПОЛНЫЙ хвост отчёта.
+
+Ошибка добычи контента/LLM: пользователь получает error-сообщение (error-путь),
+а джоба помечается упавшей — process_job пробрасывает исключение после
+доставки, llm_worker ставит mark_failed (см. tests/e2e/test_recovery.py).
 """
 
 import asyncio
@@ -15,13 +20,15 @@ import re
 from types import SimpleNamespace
 
 import discord
+import pytest
 
-from bot.analysis.report import Report, render_report_messages
+from bot.analysis.report import Report, ReportParseError, render_report_messages
 from bot.delivery import render
 from bot.pipeline import process_job
 
 VIDEO_ID = "abcdefghijk"
-LINK = f"https://youtu.be/{VIDEO_ID}"
+URL = f"https://youtu.be/{VIDEO_ID}"
+LINK = URL  # рендер-ссылка = doc.url экстрактора
 
 
 def _long_section_body(with_fence):
@@ -51,16 +58,17 @@ BIG_ANALYSIS = {
 MINIMAL_ANALYSIS = {"brief": "Коротко и ясно"}
 
 
-def _patch_transcript(monkeypatch, transcript="субтитры", exc=None):
-    """Подменяет fetch_transcript в пространстве имён bot.pipeline (контракт пайплайна)."""
+def _job(extractor, thread_id, **extra):
+    """Джоба нового формата (фаза 4): canonical_id считает экстрактор."""
 
-    def _fake(video_id):
-        if exc is not None:
-            raise exc
-        assert video_id == VIDEO_ID
-        return transcript
-
-    monkeypatch.setattr("bot.pipeline.fetch_transcript", _fake)
+    job = {
+        "kind": extractor.name,
+        "url": URL,
+        "canonical_id": extractor.canonical_id(URL),
+        "thread_id": thread_id,
+    }
+    job.update(extra)
+    return job
 
 
 class BrokenThread:
@@ -77,14 +85,18 @@ class BrokenThread:
 
 class TestHappyPath:
     def test_block_report_delivered_progressively(
-        self, monkeypatch, make_deps, make_thread, make_status, make_llm
+        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
     ):
         thread = make_thread(4242)
         status = make_status()
-        deps = make_deps(thread=thread, llm=make_llm(analysis_json=BIG_ANALYSIS))
-        _patch_transcript(monkeypatch)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=BIG_ANALYSIS),
+            router=make_router([extractor]),
+        )
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         sent = thread.sent
         assert sent, "сообщения не отправлены"
@@ -111,70 +123,93 @@ class TestHappyPath:
         assert all(f"**Раздел {i}**" in "".join(sent) for i in range(6))
         assert "завершение раздела" in "".join(sent)
         assert status.deleted
-        # транскрипт дошёл до LLM в неизменном виде
+        # контент экстрактора дошёл до LLM в неизменном виде
         assert deps.llm.calls == ["субтитры"]
+        assert extractor.extract_calls == [URL], "контент добыт по url джобы"
 
-    def test_minimal_report_single_message(self, monkeypatch, make_deps, make_thread, make_llm):
+    def test_minimal_report_single_message(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router
+    ):
         # отчёт только с brief: ровно одно сообщение — заголовок разбора + кратко
         thread = make_thread(4242)
-        deps = make_deps(thread=thread, llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)))
-        _patch_transcript(monkeypatch)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": None}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id, status=None)))
 
         assert thread.sent == [f"**Разбор: {LINK}**\n\n**Кратко**\n\nКоротко и ясно"]
 
-    def test_job_without_status_key_ok(self, monkeypatch, make_deps, make_thread, make_llm):
+    def test_job_without_status_key_ok(self, make_deps, make_thread, make_llm, make_extractor, make_router):
         # поле status в job опционально — его отсутствие не должно падать
         thread = make_thread(4242)
-        deps = make_deps(thread=thread, llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)))
-        _patch_transcript(monkeypatch)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         assert thread.sent == [f"**Разбор: {LINK}**\n\n**Кратко**\n\nКоротко и ясно"]
 
 
 class TestErrorPath:
-    def test_transcript_failure_posts_error_message(self, monkeypatch, make_deps, make_thread, make_status):
+    def test_extraction_failure_posts_error_message(
+        self, make_deps, make_thread, make_status, make_extractor, make_router
+    ):
+        # экстрактор не добыл контент: error-сообщение пользователю, статус закрыт;
+        # исключение пробрасывается — воркер пометит джобу failed
         thread = make_thread(4242)
         status = make_status()
-        deps = make_deps(thread=thread)
-        _patch_transcript(monkeypatch, exc=RuntimeError("нет доступных субтитров"))
+        extractor = make_extractor(extract_error=RuntimeError("нет доступных субтитров"))
+        deps = make_deps(thread=thread, router=make_router([extractor]))
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         assert len(thread.sent) == 1
         # причина попадает в шаблон ошибки из prompts.yaml ({reason})
         assert "нет доступных субтитров" in thread.sent[0]
         assert status.deleted
 
-    def test_llm_failure_posts_error_message(self, monkeypatch, make_deps, make_thread, make_status, make_llm):
+    def test_llm_failure_posts_error_message(
+        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
+    ):
         thread = make_thread(4242)
         status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             thread=thread,
             llm=make_llm(error=RuntimeError("LLM недоступна")),
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         assert len(thread.sent) == 1
         assert "LLM недоступна" in thread.sent[0]
         assert status.deleted
 
-    def test_error_message_without_disk_prompts_read(self, monkeypatch, make_deps, make_thread, make_status, make_llm):
+    def test_error_message_without_disk_prompts_read(
+        self, monkeypatch, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
+    ):
         # битый prompts.yaml на диске не мешает error-сообщению: шаблон берётся
         # из Deps.prompts (в памяти), диск error-ветка не перечитывает
         thread = make_thread(4242)
         status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             thread=thread,
             llm=make_llm(error=RuntimeError("LLM недоступна")),
             prompts={"error": "упс: {reason}"},
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
         disk_reads = []
 
@@ -185,7 +220,8 @@ class TestErrorPath:
 
         monkeypatch.setattr("bot.pipeline.load_prompts", _broken_yaml)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         assert len(thread.sent) == 1
         assert "упс: LLM недоступна" in thread.sent[0]
@@ -193,16 +229,21 @@ class TestErrorPath:
         assert disk_reads == [], "error-путь не должен перечитывать prompts.yaml"
 
     def test_error_message_strips_mentions_from_reason(
-        self, monkeypatch, make_deps, make_thread, make_status, make_llm
+        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
     ):
         # LLM/провайдер могут вернуть текст с mention: фрагмент сырья уходит в
         # {reason}, но бот не должен тегать людей в треде
         thread = make_thread(4242)
         status = make_status()
-        deps = make_deps(thread=thread, llm=make_llm(raw="@everyone сломалось, пинг <@123"))
-        _patch_transcript(monkeypatch)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(raw="@everyone сломалось, пинг <@123"),
+            router=make_router([extractor]),
+        )
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        with pytest.raises(ReportParseError):
+            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         assert len(thread.sent) == 1
         sent = thread.sent[0]
@@ -210,6 +251,49 @@ class TestErrorPath:
         assert "@everyone" not in sent, "mention @everyone вырезан из {reason}"
         assert "<@" not in sent, "начало <@-пинга вырезано из {reason}"
         assert status.deleted
+
+    def test_unknown_kind_posts_error_and_raises(
+        self, make_deps, make_thread, make_status, make_extractor, make_router
+    ):
+        # kind джобы нет в реестре экстракторов: error-путь с человеческим
+        # текстом (а не AttributeError на None.extract); исключение
+        # пробрасывается — воркер пометит джобу failed
+        thread = make_thread(4242)
+        status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(thread=thread, router=make_router([extractor]))
+        job = _job(extractor, thread.id, status=status)
+        job["kind"] = "gone"
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, job))
+
+        assert any("неизвестный тип источника: gone" in c for c in thread.sent), (
+            "человеческий текст причины в треде"
+        )
+        assert status.deleted
+
+    def test_send_failure_on_error_buffers_message_and_keeps_status(
+        self, make_deps, make_client, make_status, make_extractor, make_router
+    ):
+        # Discord лежит И экстрактор упал: error-сообщение буферизуется, статус
+        # НЕ закрывается (симметрично success-ветке), исключение пробрасывается —
+        # воркер пометит джобу failed
+        thread = FailAfterThread(4242, ok_sends=0)
+        status = make_status()
+        extractor = make_extractor(extract_error=RuntimeError("нет доступных субтитров"))
+        deps = make_deps(client=make_client({4242: thread}), router=make_router([extractor]))
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
+
+        assert thread.sent, "попытки отправки error-сообщения были"
+        items = deps.outbox.load()
+        assert len(items) == 1 and "нет доступных субтитров" in items[0]["content"], (
+            "error-сообщение целиком в буфере"
+        )
+        assert all(i["thread_id"] == thread.id for i in items)
+        assert not status.deleted, "при буферизации статусное сообщение остаётся"
 
 
 class FailAfterThread:
@@ -242,7 +326,7 @@ def _expected_chunks(deps):
 
 class TestOfflineDiscord:
     def test_send_failure_buffers_full_tail_of_report(
-        self, monkeypatch, make_deps, make_client, make_status, make_llm
+        self, make_deps, make_client, make_status, make_llm, make_extractor, make_router
     ):
         # кратко и тезисы доставлены; первое сообщение-раздел падает на первом
         # чанке — в буфер уходит ПОЛНЫЙ хвост отчёта: все чанки упавшего сообщения
@@ -250,13 +334,14 @@ class TestOfflineDiscord:
         ok_sends = 2
         thread = FailAfterThread(4242, ok_sends=ok_sends)
         status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             client=make_client({4242: thread}),
             llm=make_llm(analysis_json=BIG_ANALYSIS),
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         chunks_per_msg = _expected_chunks(deps)
         flat = [c for chunks in chunks_per_msg for c in chunks]
@@ -280,18 +365,19 @@ class TestOfflineDiscord:
         assert not status.deleted
 
     def test_send_failure_on_first_chunk_buffers_entire_report(
-        self, monkeypatch, make_deps, make_client, make_status, make_llm
+        self, make_deps, make_client, make_status, make_llm, make_extractor, make_router
     ):
         # Discord лежит с самого начала: буферизуются ВСЕ чанки ВСЕХ сообщений
         thread = FailAfterThread(4242, ok_sends=0)
         status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             client=make_client({4242: thread}),
             llm=make_llm(analysis_json=BIG_ANALYSIS),
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         flat = [c for chunks in _expected_chunks(deps) for c in chunks]
 

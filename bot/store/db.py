@@ -1,8 +1,9 @@
 """SQLite-хранилище: единственное соединение + идемпотентные миграции.
 
-Store — владелец соединения; репозитории (reports, outbox) — фасады над ним
-и доступны как свойства. Журнал WAL: читатели не блокируют писателя, а режим
-персистентен в файле БД (виден любому внешнему соединению).
+Store — владелец соединения; репозитории (reports, outbox, authors, jobs,
+dedup) — фасады над ним и доступны как свойства. Журнал WAL: читатели не
+блокируют писателя, а режим персистентен в файле БД (виден любому внешнему
+соединению).
 """
 
 import sqlite3
@@ -10,6 +11,8 @@ import threading
 from contextlib import contextmanager
 
 from bot.store.authors import AuthorStore
+from bot.store.dedup import DedupStore
+from bot.store.jobs import JobStore
 from bot.store.outbox import DbOutbox
 from bot.store.reports import ReportStore
 
@@ -70,6 +73,25 @@ _MIGRATIONS = {
             PRIMARY KEY (platform, handle)
         );
     """,
+    # шаг 4 (фаза 4): задачи и дедуп сообщений переживают рестарт (§10);
+    # AUTOINCREMENT у jobs — строгая FIFO по id, id не переиспользуются;
+    # дедуп по message_id (текстовый PK: дедуп по сообщению, не по canonical)
+    4: """
+        CREATE TABLE IF NOT EXISTS jobs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload_json TEXT NOT NULL,
+            state        TEXT NOT NULL DEFAULT 'new',
+            created_at   INTEGER,
+            updated_at   INTEGER,
+            error        TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id   TEXT PRIMARY KEY,
+            canonical_id TEXT,
+            created_at   INTEGER
+        );
+    """,
 }
 
 
@@ -90,6 +112,8 @@ class Store:
         self._reports = ReportStore(self)
         self._outbox = DbOutbox(self)
         self._authors = AuthorStore(self)
+        self._jobs = JobStore(self)
+        self._dedup = DedupStore(self)
 
     def _migrate(self) -> None:
         """Применяет недостающие шаги миграции.
@@ -151,6 +175,16 @@ class Store:
     def authors(self) -> AuthorStore:
         """Репозиторий кеша обзоров авторов — единый на Store."""
         return self._authors
+
+    @property
+    def jobs(self) -> JobStore:
+        """Репозиторий задач — единый на Store."""
+        return self._jobs
+
+    @property
+    def dedup(self) -> DedupStore:
+        """Репозиторий дедупа сообщений — единый на Store."""
+        return self._dedup
 
     def close(self) -> None:
         """Закрывает соединение; данные уже закоммичены каждой транзакцией."""

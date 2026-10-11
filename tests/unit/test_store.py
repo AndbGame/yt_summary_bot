@@ -82,6 +82,110 @@ class TestSchema:
         assert str(mode).lower() == "wal"
 
 
+class TestPhase4Schema:
+    """Схема фазы 4: задачи (jobs) и дедуп сообщений (processed_messages) в БД."""
+
+    def test_jobs_table_shape(self, tmp_path):
+        path = tmp_path / "db.sqlite3"
+        store = Store(path)
+        store.close()
+
+        rows = _sql(path, "PRAGMA table_info(jobs)")
+        assert [r[1] for r in rows] == [
+            "id",
+            "payload_json",
+            "state",
+            "created_at",
+            "updated_at",
+            "error",
+        ]
+        # id — целочисленный первичный ключ
+        assert "INT" in rows[0][2].upper()
+        assert rows[0][5] == 1
+        # payload_json и state обязательны
+        for idx in (1, 2):
+            assert "TEXT" in rows[idx][2].upper()
+            assert rows[idx][3] == 1  # NOT NULL
+        # новые джобы — state 'new' по умолчанию
+        assert rows[2][4] is not None and "new" in rows[2][4]
+        # error и штампы nullable
+        for idx in (3, 4, 5):
+            assert rows[idx][3] == 0
+        # AUTOINCREMENT: строгая FIFO по id — id не переиспользуются
+        ddl = _sql(path, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'")
+        assert "AUTOINCREMENT" in ddl[0][0].upper()
+
+    def test_processed_messages_table_shape(self, tmp_path):
+        path = tmp_path / "db.sqlite3"
+        store = Store(path)
+        store.close()
+
+        rows = _sql(path, "PRAGMA table_info(processed_messages)")
+        assert [r[1] for r in rows] == ["message_id", "canonical_id", "created_at"]
+        # message_id — текстовый первичный ключ (дедуп по сообщению)
+        assert "TEXT" in rows[0][2].upper()
+        assert rows[0][5] == 1
+        assert "TEXT" in rows[1][2].upper()
+        assert "INT" in rows[2][2].upper()
+
+    def test_fresh_db_user_version_at_least_4(self, tmp_path):
+        path = tmp_path / "db.sqlite3"
+        store = Store(path)
+        store.close()
+
+        assert _sql(path, "PRAGMA user_version")[0][0] >= 4, "миграция шага 4 применена"
+
+    def test_store_exposes_jobs_and_dedup(self, tmp_path):
+        from bot.store.dedup import DedupStore
+        from bot.store.jobs import JobStore
+
+        store = Store(str(tmp_path / "db.sqlite3"))
+        try:
+            assert isinstance(store.jobs, JobStore)
+            assert isinstance(store.dedup, DedupStore)
+        finally:
+            store.close()
+
+    def test_v3_database_migrates_to_phase4(self, tmp_path):
+        """БД формата фазы 3 (user_version=3) при открытии получает таблицы фазы 4,
+        данные авторов остаются читаемыми."""
+        path = tmp_path / "legacy3.sqlite3"
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE authors (
+                    platform     TEXT NOT NULL,
+                    handle       TEXT NOT NULL,
+                    display_name TEXT,
+                    facts_json   TEXT,
+                    review_json  TEXT,
+                    prompts_ver  TEXT,
+                    analyzed_at  INTEGER,
+                    refreshed_at INTEGER,
+                    PRIMARY KEY (platform, handle)
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO authors VALUES ('youtube', 'UC1', 'Имя', '{}', 'обзор', '2', 1, 1)"
+            )
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = Store(path)
+        try:
+            assert _sql(path, "PRAGMA user_version")[0][0] >= 4, "шаг миграции 4 применён"
+            row = store.authors.get("youtube", "UC1")
+            assert row is not None and row["review_json"] == "обзор", "данные фазы 3 живы"
+            store.jobs.put({"kind": "video", "url": "u"})
+            assert len(store.jobs.take_new()) == 1, "jobs работают сразу после миграции"
+        finally:
+            store.close()
+
+
 class TestMigrations:
     def test_two_stores_on_same_file_idempotent(self, tmp_path):
         # повторное создание Store на том же файле — миграции применяются

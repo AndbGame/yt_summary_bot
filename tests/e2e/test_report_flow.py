@@ -1,4 +1,4 @@
-"""E2E фазы 2: полный путь JSON-отчёта LLM в треде (прогрессивный рендер).
+"""E2E фазы 2 (+джобы фазы 4): полный путь JSON-отчёта LLM в треде.
 
 Сценарии:
 - валидный JSON-ответ LLM -> тред получает [кратко(+контекст сложной темы),
@@ -6,7 +6,8 @@
 - превышенный бюджет блока -> рендер помечает сообщение маркером обрезки,
   доставка не падает;
 - LLM вернул мусор (не JSON) после всех попыток -> error-промпт, в кеш ничего
-  не попадает.
+  не попадает; process_job пробрасывает исключение после доставки (воркер
+  пометит джобу failed, фаза 4).
 
 Отдельного «текстового» фоллбека в контракте НЕТ: непарсимый ответ — это ретраи
 LLMClient и, после исчерпания попыток, исключение -> error-промпт (здесь
@@ -15,10 +16,14 @@ LLMClient и, после исчерпания попыток, исключени
 
 import asyncio
 
+import pytest
+
+from bot.analysis.report import ReportParseError
 from bot.pipeline import process_job
 
 VIDEO_ID = "abcdefghijk"
-LINK = f"https://youtu.be/{VIDEO_ID}"
+URL = f"https://youtu.be/{VIDEO_ID}"
+LINK = URL
 
 ANALYSIS = {
     "brief": "Видео про настройку домашнего сервера.",
@@ -36,22 +41,33 @@ BUDGETS = {"brief": 240, "context": 400, "theses": 1200, "section": 1200, "autho
 PROMPTS = {"version": "2", "error": "Не смог: {reason}", "budgets": BUDGETS}
 
 
-def _patch_transcript(monkeypatch, transcript="субтитры"):
-    monkeypatch.setattr("bot.pipeline.fetch_transcript", lambda video_id: transcript)
+def _job(extractor, thread_id, **extra):
+    """Джоба нового формата (фаза 4): canonical_id считает экстрактор."""
+    job = {
+        "kind": extractor.name,
+        "url": URL,
+        "canonical_id": extractor.canonical_id(URL),
+        "thread_id": thread_id,
+    }
+    job.update(extra)
+    return job
 
 
 class TestProgressiveDelivery:
     def test_full_report_delivered_block_by_block(
-        self, monkeypatch, make_deps, make_thread, make_status, make_llm
+        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
     ):
         thread = make_thread(4242)
         status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
-            thread=thread, llm=make_llm(analysis_json=ANALYSIS), prompts=dict(PROMPTS)
+            thread=thread,
+            llm=make_llm(analysis_json=ANALYSIS),
+            prompts=dict(PROMPTS),
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         sent = thread.sent
         # порядок сообщений: [кратко(+контекст), тезисы, разделы...]
@@ -80,7 +96,7 @@ class TestProgressiveDelivery:
         assert deps.llm.calls == ["субтитры"]
 
     def test_over_budget_block_truncated_with_marker(
-        self, monkeypatch, make_deps, make_thread, make_llm
+        self, make_deps, make_thread, make_llm, make_extractor, make_router
     ):
         thread = make_thread(4242)
         tight = {
@@ -88,14 +104,15 @@ class TestProgressiveDelivery:
             "error": "Не смог: {reason}",
             "budgets": {"brief": 20, "context": 400, "theses": 1200, "section": 1200, "author": 900},
         }
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             thread=thread,
             llm=make_llm(analysis_json={"brief": "Б" * 60, "theses": ["тезис"]}),
             prompts=tight,
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": None}))
+        asyncio.run(process_job(deps, _job(extractor, thread.id, status=None)))
 
         assert len(thread.sent) == 2
         first = thread.sent[0]
@@ -107,18 +124,20 @@ class TestProgressiveDelivery:
         assert thread.sent[1] == "**Тезисы**\n\n- тезис"
 
     def test_garbage_answer_posts_error_and_not_cached(
-        self, monkeypatch, make_deps, make_thread, make_status, make_llm
+        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
     ):
         thread = make_thread(4242)
         status = make_status()
+        extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             thread=thread,
             llm=make_llm(raw="мне жаль, я не понял запрос"),
             prompts=dict(PROMPTS),
+            router=make_router([extractor]),
         )
-        _patch_transcript(monkeypatch)
 
-        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+        with pytest.raises(ReportParseError):
+            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         assert len(thread.sent) == 1, "после исчерпания попыток — один error-промпт"
         assert "Не смог" in thread.sent[0]

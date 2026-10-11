@@ -8,6 +8,7 @@
 import asyncio
 import dataclasses
 import itertools
+import re
 import sys
 import time
 from pathlib import Path
@@ -25,20 +26,36 @@ if str(ROOT) not in sys.path:
 
 
 class FakeThread:
-    """Тред-фейк: копит отправленные сообщения в sent."""
+    """Тред-фейк: копит отправленные сообщения в sent.
+
+    fetchable — сообщения, «существующие» на стороне Discord и доступные
+    fetch_message: recovery фазы 4 прикрепляет статусное сообщение к
+    восстановленной после рестарта джобе.
+    """
 
     def __init__(self, id=4242):
         self.id = id
         self.sent = []
+        self.fetchable = {}
 
     async def send(self, content):
         self.sent.append(content)
 
+    async def fetch_message(self, message_id):
+        if message_id in self.fetchable:
+            return self.fetchable[message_id]
+        raise discord.NotFound(SimpleNamespace(status=404, reason="x"), "нет сообщения")
+
 
 class FakeStatus:
-    """Статусное сообщение-фейк: запоминает удаление и правки текста."""
+    """Статусное сообщение-фейк: запоминает удаление и правки текста.
 
-    def __init__(self):
+    id нужен фазе 4: handle() кладёт status_message_id в джобу, recovery по
+    нему находит сообщение через fetch_message.
+    """
+
+    def __init__(self, id=None):
+        self.id = id
         self.deleted = False
         self.edits = []
 
@@ -49,8 +66,8 @@ class FakeStatus:
         self.edits.append(content)
 
 
-# Уникальные id сообщений между тестами: дедуп в discord_app — in-memory set,
-# и уникальные ключи «message.id:video_id» изолируют тесты без сброса глобала.
+# Уникальные id сообщений между тестами: дедуп (фаза 4 — в БД) keyed by
+# message.id, уникальные id изолируют тесты без сброса общего состояния.
 _message_ids = itertools.count(1001)
 
 
@@ -58,21 +75,25 @@ class FakeMessage:
     """Сообщение-фейк для handle(): reply() -> статус, create_thread() -> тред.
 
     thread может быть тредом (обычный путь), исключением (создание падает)
-    или None (создание треда не ожидалось).
+    или None (создание треда не ожидалось). status_id — id статусного сообщения
+    (фаза 4: попадает в джобу как status_message_id). kwargs create_thread
+    записываются в thread_kwargs — так тесты проверяют имя треда.
     """
 
-    def __init__(self, content, *, id=None, thread=None, channel=None):
+    def __init__(self, content, *, id=None, thread=None, channel=None, status_id=None):
         self.id = id if id is not None else next(_message_ids)
         self.content = content
         self.author = SimpleNamespace(bot=False)
         self.channel = channel if channel is not None else SimpleNamespace(id=10, threads=[])
-        self.status = FakeStatus()
+        self.status = FakeStatus(id=status_id)
         self._thread = thread
+        self.thread_kwargs = None
 
     async def reply(self, text=""):
         return self.status
 
     async def create_thread(self, **kwargs):
+        self.thread_kwargs = kwargs
         if isinstance(self._thread, Exception):
             raise self._thread
         return self._thread
@@ -187,25 +208,27 @@ class InMemoryReportStore:
 
 
 class FakeAuthorFactsProvider:
-    """Фейк deps.author_facts (фаза 3): настраиваемые результаты get()/get_channel().
+    """Фейк deps.author_facts: настраиваемые результаты get_author_ref()/get_channel().
 
-    get_result — ответ get(video_id): None («автора нет/сеть упала») или (ref, facts);
-    get_channel_result — ответ get_channel(ref): None или facts. ref/facts — утиной
-    типизации (в тестах SimpleNamespace): пайплайн читает только атрибуты
-    platform/handle и name/url, так что настоящие dataclass'ы фазы 3 совместимы.
-    Вызовы считаются: e2e проверяет «провайдер не зовётся на кеш-хите» и «ровно
-    один вызов на промахе».
+    Фаза 4 сменила контракт MISS-пути: провайдер сначала даёт AuthorRef по URL
+    (get_author_ref, oEmbed), факты канала — отдельно через get_channel(ref).
+    get_author_ref_result — ответ get_author_ref(url): None (автора нет/сеть
+    упала) или ref; get_channel_result — ответ get_channel(ref): None или facts.
+    ref/facts — утиной типизации (в тестах SimpleNamespace): пайплайн читает
+    только атрибуты platform/handle и name/url. Вызовы считаются раздельно:
+    ref_calls (get_author_ref, по url) и channel_calls (get_channel); e2e
+    проверяет «провайдер не зовётся на кеш-хите» и «ровно один вызов на промахе».
     """
 
-    def __init__(self, get_result=None, get_channel_result=None):
-        self.get_result = get_result
+    def __init__(self, get_author_ref_result=None, get_channel_result=None):
+        self.get_author_ref_result = get_author_ref_result
         self.get_channel_result = get_channel_result
-        self.get_calls = []
+        self.ref_calls = []
         self.channel_calls = []
 
-    def get(self, video_id):
-        self.get_calls.append(video_id)
-        return self.get_result
+    def get_author_ref(self, url):
+        self.ref_calls.append(url)
+        return self.get_author_ref_result
 
     def get_channel(self, ref):
         self.channel_calls.append(ref)
@@ -252,6 +275,137 @@ class InMemoryAuthorStore:
         return current - row["analyzed_at"] < ttl_seconds
 
 
+# ------------------------------------------------------ фейки фазы 4 (источники/джобы)
+
+
+class FakeExtractor:
+    """Фейк экстрактора за портом ExtractorPort (фаза 4).
+
+    transcripts — контент по url (чего нет — default_transcript); extract_error —
+    исключение из extract (контент недоступен); find_span — настроенные границы
+    совпадения, иначе ищется первый http(s)-URL в тексте. Контракт порта:
+    find(text) -> (start, end) | None — основной метод (границы для Router),
+    matches(url) производен от find; canonical_id детерминирован по url.
+    Вызовы extract считаются — e2e кеша проверяет «контент добывается всегда,
+    но LLM на хите не зовётся».
+    """
+
+    name = "video"
+
+    _URL_RE = re.compile(r"https?://\S+")
+
+    def __init__(
+        self, transcripts=None, extract_error=None, find_span=None, default_transcript="субтитры"
+    ):
+        self.transcripts = dict(transcripts or {})
+        self.extract_error = extract_error
+        self.find_span = find_span
+        self.default_transcript = default_transcript
+        self.extract_calls = []
+
+    def find(self, text):
+        if self.find_span is not None:
+            start, end = self.find_span
+            if text and 0 <= start < end <= len(text):
+                return (start, end)
+            return None
+        match = self._URL_RE.search(text or "")
+        return (match.start(), match.end()) if match else None
+
+    def matches(self, url):
+        return self.find(url) is not None
+
+    def canonical_id(self, url):
+        return f"video:{url}"
+
+    def extract(self, url):
+        from bot.sources.base import SourceDocument  # лениво: TDD фазы 4
+
+        self.extract_calls.append(url)
+        if self.extract_error is not None:
+            raise self.extract_error
+        return SourceDocument(
+            canonical_id=self.canonical_id(url),
+            kind=self.name,
+            url=url,
+            content=self.transcripts.get(url, self.default_transcript),
+        )
+
+
+class InMemoryJobStore:
+    """Фейк deps.jobs (фаза 4): тот же интерфейс, что JobStore на БД, данные в памяти.
+
+    Дефолт make_deps до реализации фазы 4 и тестам воркера, которым нужна
+    трассировка mark_done/mark_failed. take_new отдаёт payload + job_id — как
+    настоящий (state/error наружу не протекают).
+    """
+
+    def __init__(self):
+        self._rows = {}
+        self._ids = itertools.count(1)
+        self.done_calls = []
+        self.failed_calls = []
+
+    def put(self, payload):
+        job_id = next(self._ids)
+        self._rows[job_id] = {"state": "new", "error": None, **payload, "job_id": job_id}
+        return job_id
+
+    def take_new(self):
+        rows = [r for r in self._rows.values() if r["state"] == "new"]
+        return [{k: v for k, v in r.items() if k not in ("state", "error")} for r in rows]
+
+    def mark_done(self, job_id):
+        self.done_calls.append(job_id)
+        row = self._rows.get(job_id)
+        if row is not None:
+            row["state"] = "done"
+
+    def mark_failed(self, job_id, error):
+        self.failed_calls.append((job_id, error))
+        row = self._rows.get(job_id)
+        if row is not None:
+            row["state"] = "failed"
+            row["error"] = error
+
+    def count_new(self):
+        return sum(1 for r in self._rows.values() if r["state"] == "new")
+
+
+class InMemoryDedupStore:
+    """Фейк deps.dedup (фаза 4): та же семантика, что DedupStore на БД —
+    ключ message_id (PK таблицы), mark даёт True только при первой вставке."""
+
+    def __init__(self):
+        self._seen = set()
+        self.mark_calls = []
+
+    def mark(self, message_id, canonical_id):
+        self.mark_calls.append((str(message_id), canonical_id))
+        if str(message_id) in self._seen:
+            return False
+        self._seen.add(str(message_id))
+        return True
+
+
+def _default_router():
+    """Роутер по умолчанию (фаза 4): настоящий Router с FakeExtractor."""
+    from bot.router import Router
+
+    return Router([FakeExtractor()])
+
+
+def _default_job_dedup_stores(tmp_path):
+    """Джобы и дедуп по умолчанию (фаза 4): настоящие репозитории на временной
+    SQLite — e2e-сценарии дедупа и восстановления идут через ту же БД, что и прод."""
+    from bot.store.db import Store
+    from bot.store.dedup import DedupStore
+    from bot.store.jobs import JobStore
+
+    store = Store(str(tmp_path / "deps_jobs.sqlite3"))
+    return JobStore(store), DedupStore(store)
+
+
 # --------------------------------------------------------- фикстуры-фабрики
 
 
@@ -289,9 +443,43 @@ def make_llm():
 
 @pytest.fixture
 def make_author_facts():
-    """Фабрика провайдера фактов автора (фаза 3):
-    make_author_facts(get_result=(ref, facts), get_channel_result=facts)."""
+    """Фабрика провайдера фактов автора:
+    make_author_facts(get_author_ref_result=ref, get_channel_result=facts)."""
     return FakeAuthorFactsProvider
+
+
+@pytest.fixture
+def make_extractor():
+    """Фабрика фейк-экстрактора (фаза 4): make_extractor(transcripts={url: текст},
+    extract_error=exc, find_span=(start, end))."""
+    return FakeExtractor
+
+
+@pytest.fixture
+def make_router():
+    """Фабрика настоящего Router (фаза 4): make_router([extractor, ...]).
+
+    Импорт ленивый: до реализации фазы 4 тест падает точечно, а не ломает
+    коллекцию файла (TDD)."""
+
+    def _make(extractors):
+        from bot.router import Router
+
+        return Router(extractors)
+
+    return _make
+
+
+@pytest.fixture
+def make_job_store():
+    """Фабрика in-memory JobStore-фейка (с трассировкой mark_done/mark_failed)."""
+    return InMemoryJobStore
+
+
+@pytest.fixture
+def make_dedup_store():
+    """Фабрика in-memory DedupStore-фейка (с трассировкой mark)."""
+    return InMemoryDedupStore
 
 
 @pytest.fixture
@@ -306,10 +494,12 @@ def make_deps(tmp_path, make_client, make_llm):
 
     По умолчанию: конфиг с тестовыми токенами, фейк-клиент, фейк-LLM,
     PendingOutbox во временном файле, InMemoryReportStore как кеш отчётов
-    (deps.reports), реальный SafeSender поверх фейков и заготовки фазы 3:
-    провайдер фактов без результатов (get/get_channel -> None), пустой
-    InMemoryAuthorStore, реальная asyncio.Queue фоновой очереди; llm_lock=None
-    (сериализация LLM включается только в тестах блокировки).
+    (deps.reports), реальный SafeSender поверх фейков, заготовки фазы 3
+    (провайдер фактов без результатов, пустой InMemoryAuthorStore, реальная
+    asyncio.Queue фоновой очереди, llm_lock=None) и фазы 4: deps.router —
+    Router с FakeExtractor, deps.jobs/deps.dedup — настоящие JobStore/DedupStore
+    на временной SQLite, чтобы сценарии дедупа и восстановления шли через ту же
+    БД, что и прод.
     """
     from bot import jobs as jobs_mod
     from bot.analysis.prompts import load_prompts
@@ -336,6 +526,9 @@ def make_deps(tmp_path, make_client, make_llm):
         authors=None,
         background_queue=None,
         llm_lock=None,
+        router=None,
+        jobs=None,
+        dedup=None,
     ):
         if config is None:
             config = BotConfig(bot_token="test-token", llm_api_key="test-key")
@@ -364,15 +557,26 @@ def make_deps(tmp_path, make_client, make_llm):
             authors = InMemoryAuthorStore()
         if background_queue is None:
             background_queue = asyncio.Queue()
-        # поля Deps фазы 3: если уже объявлены — передаём конструктору; пока их нет
-        # (тесты написаны под контракт раньше реализации, TDD) — донашиваем setattr'ом,
-        # чтобы все существующие тесты оставались зелёными и до, и после реализации
+        if router is None:
+            router = _default_router()
+        if jobs is None or dedup is None:
+            default_jobs, default_dedup = _default_job_dedup_stores(tmp_path)
+            if jobs is None:
+                jobs = default_jobs
+            if dedup is None:
+                dedup = default_dedup
+        # поля фаз 3-4: если уже объявлены в Deps — передаём конструктору; пока их
+        # нет (тесты написаны под контракт раньше реализации, TDD) — донашиваем
+        # setattr'ом, чтобы все существующие тесты оставались зелёными и до, и
+        # после реализации
         phase3 = {
             "author_facts": author_facts,
             "authors": authors,
             "background_queue": background_queue,
             "llm_lock": llm_lock,
         }
+        phase4 = {"router": router, "jobs": jobs, "dedup": dedup}
+        injectable = {**phase3, **phase4}
         declared = {f.name for f in dataclasses.fields(Deps)}
         deps = Deps(
             config=config,
@@ -383,9 +587,9 @@ def make_deps(tmp_path, make_client, make_llm):
             client=client,
             queue=queue,
             reports=reports,
-            **{name: value for name, value in phase3.items() if name in declared},
+            **{name: value for name, value in injectable.items() if name in declared},
         )
-        for name, value in phase3.items():
+        for name, value in injectable.items():
             if name not in declared:
                 setattr(deps, name, value)
         return deps

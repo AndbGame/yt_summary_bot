@@ -18,6 +18,8 @@ from bot.config import ENV_NAMES, BotConfig
 from bot.delivery.sender import SafeSender
 from bot.jobs import create_background_queue, create_queue
 from bot.pipeline import Deps
+from bot.router import Router
+from bot.sources.youtube import YoutubeExtractor
 from bot.store.db import Store
 
 # Буфер недоставленных ответов — в корне репозитория (рядом с шимом), как у монолита
@@ -42,7 +44,8 @@ def _resolve_db_path(db_path: str) -> Path:
 
 
 def build_deps(config: BotConfig) -> Deps:
-    """Собирает реальные зависимости: промпты, LLM, SQLite-хранилище, отправитель, клиент."""
+    """Собирает реальные зависимости: промпты, LLM, SQLite-хранилище, роутер
+    экстракторов, отправитель, клиент."""
     # prompts.yaml читается с диска ровно один раз: и в LLMClient, и в error-ветку пайплайна
     prompts = load_prompts()
     # Store — владелец единственного соединения; закрывать его здесь нельзя:
@@ -68,6 +71,11 @@ def build_deps(config: BotConfig) -> Deps:
         authors=store.authors,
         background_queue=create_background_queue(),
         llm_lock=asyncio.Lock(),
+        # фаза 4: реестр экстракторов (YouTube — первый, порядок = приоритет),
+        # джобы и дедуп сообщений — репозитории БД (переживают рестарт)
+        router=Router([YoutubeExtractor()]),
+        jobs=store.jobs,
+        dedup=store.dedup,
     )
     discord_app.attach_handlers(client, deps)
     return deps
