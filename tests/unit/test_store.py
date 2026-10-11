@@ -1,10 +1,11 @@
-"""Юнит-тесты SQLite-хранилища фазы 1 (bot/store): миграции, кеш отчётов, outbox в БД.
+"""Юнит-тесты SQLite-хранилища (bot/store): миграции, кеш отчётов, outbox в БД.
 
-Контракт (docs/ARCHITECTURE.md §7, §12 фаза 1): Store владеет одним соединением
+Контракт (docs/ARCHITECTURE.md §7, §12 фазы 1-2): Store владеет одним соединением
 (check_same_thread=False + внутренняя блокировка записи), миграции применяются
-идемпотентно через PRAGMA user_version, журнал WAL. Схема проверяется прямыми
-SQL-запросами к файлу БД из отдельного соединения — как внешний наблюдатель,
-независимо от внутренних деталей реализации.
+идемпотентно через PRAGMA user_version, журнал WAL. Фаза 2 добавила в reports
+колонку content_hash (шаг миграции 2) — она часть ключа кеша. Схема проверяется
+прямыми SQL-запросами к файлу БД из отдельного соединения — как внешний
+наблюдатель, независимо от внутренних деталей реализации.
 
 Поведение close() зафиксировано так: close() завершает работу чисто, а повторное
 открытие того же файла новым Store видит все записанные данные (переживает
@@ -29,7 +30,7 @@ def _sql(db_path, statement):
 
 
 class TestSchema:
-    """Схема обеих таблиц зафиксирована контрактом фазы 1."""
+    """Схема таблиц зафиксирована контрактом фаз 1-2."""
 
     def test_reports_table_shape(self, tmp_path):
         path = tmp_path / "db.sqlite3"
@@ -37,17 +38,19 @@ class TestSchema:
         store.close()
 
         rows = _sql(path, "PRAGMA table_info(reports)")
+        # content_hash добавлен шагом миграции 2 (ALTER TABLE) — последней колонкой
         assert [r[1] for r in rows] == [
             "canonical_id",
             "prompts_ver",
             "schema_ver",
             "payload",
             "created_at",
+            "content_hash",
         ]
         # типы: TEXT у текстовых колонок, числовая created_at (INT и INTEGER —
         # одна affinity в SQLite, проверяем смысл, а не синоним)
-        for row in rows[:4]:
-            assert "TEXT" in row[2].upper()
+        for idx in (0, 1, 2, 3, 5):
+            assert "TEXT" in rows[idx][2].upper()
         assert "INT" in rows[4][2].upper()
         # составной первичный ключ ровно из трёх колонок, в объявленном порядке
         pk = [r[1] for r in sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])]
@@ -99,9 +102,55 @@ class TestMigrations:
         s2.close()
         s1.close()
 
-        # user_version — механизм идемпотентности миграций: применён и больше нуля
+        # user_version — механизм идемпотентности миграций: применены оба шага
         version = _sql(path, "PRAGMA user_version")[0][0]
-        assert version >= 1
+        assert version >= 2
+
+    def test_v1_database_without_content_hash_migrates_on_open(self, tmp_path):
+        """БД формата фазы 1 (user_version=1) мигрирует при открытии новым Store:
+        шаг 2 добавляет колонку content_hash, старые строки получают NULL и
+        остаются читаемыми (get с None-хэшем совпадает с NULL/"")."""
+        path = tmp_path / "legacy.sqlite3"
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE reports (
+                    canonical_id TEXT NOT NULL,
+                    prompts_ver  TEXT NOT NULL,
+                    schema_ver   TEXT NOT NULL,
+                    payload      TEXT NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    PRIMARY KEY (canonical_id, prompts_ver, schema_ver)
+                );
+                CREATE TABLE outbox (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id  INTEGER NOT NULL,
+                    content    TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO reports VALUES "
+                "('youtube:video:old', '1', 'summary-1', 'легаси-отчёт', 1700000000)"
+            )
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = Store(path)
+        try:
+            assert _sql(path, "PRAGMA user_version")[0][0] == 2, "применён шаг миграции 2"
+            cols = [r[1] for r in _sql(path, "PRAGMA table_info(reports)")]
+            assert cols[-1] == "content_hash"
+            # старые строки читаются через get с None-хэшем (NULL в колонке)
+            assert store.reports.get("youtube:video:old", "1", "summary-1") == "легаси-отчёт"
+            # но конкретный хэш со старой строкой не совпадает
+            assert store.reports.get("youtube:video:old", "1", "summary-1", "abc123") is None
+        finally:
+            store.close()
 
 
 class TestStore:
@@ -171,6 +220,92 @@ class TestReportStore:
             # запись под другим ключом не затирает исходную
             store.reports.put("youtube:video:xyz", "1", "summary-1", "другое видео")
             assert store.reports.get("youtube:video:abc", "1", "summary-1") == "саммари"
+        finally:
+            store.close()
+
+
+class TestReportStoreContentHash:
+    """content_hash — четвёртая часть ключа кеша (фаза 2): инвалидация при
+    изменении контента источника при том же video_id.
+
+    Схема PK не меняется (шаг миграции 2 — только ALTER TABLE ADD COLUMN,
+    content_hash — обычная колонка для сравнения в WHERE), поэтому запись
+    отчёта по той же тройке (canonical, prompts_ver, schema_ver) с новым хэшем
+    замещает прежнюю.
+    """
+
+    def test_content_hash_filters_rows(self, tmp_path):
+        store = Store(str(tmp_path / "db.sqlite3"))
+        try:
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "отчёт", content_hash="hash1")
+
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1", "hash1") == "отчёт"
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1", "hash2") is None
+        finally:
+            store.close()
+
+    def test_new_hash_replaces_previous_report(self, tmp_path):
+        store = Store(str(tmp_path / "db.sqlite3"))
+        try:
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "отчёт v1", content_hash="hash1")
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "отчёт v2", content_hash="hash2")
+
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1", "hash2") == "отчёт v2"
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1", "hash1") is None, (
+                "PK остаётся тройкой: новый хэш замещает прежний отчёт"
+            )
+        finally:
+            store.close()
+
+    def test_put_default_hash_is_empty_and_matches_legacy_get(self, tmp_path):
+        # put без content_hash пишет "" — get с None-хэшем совпадает с NULL/""
+        store = Store(str(tmp_path / "db.sqlite3"))
+        try:
+            store.reports.put("youtube:video:abc", "1", "summary-1", "старый отчёт")
+            assert store.reports.get("youtube:video:abc", "1", "summary-1") == "старый отчёт"
+            assert store.reports.get("youtube:video:abc", "1", "summary-1", None) == "старый отчёт"
+        finally:
+            store.close()
+
+    def test_get_with_none_hash_does_not_match_hashed_row(self, tmp_path):
+        store = Store(str(tmp_path / "db.sqlite3"))
+        try:
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "новый отчёт", content_hash="abc")
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1") is None
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1", None) is None
+        finally:
+            store.close()
+
+    def test_overwrite_same_full_key(self, tmp_path):
+        path = str(tmp_path / "db.sqlite3")
+        store = Store(path)
+        try:
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "старое", content_hash="h")
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "новое", content_hash="h")
+            assert store.reports.get("youtube:video:abc", "2", "blocks-1", "h") == "новое"
+        finally:
+            store.close()
+        # перезапись, а не вторая строка: по ключу ровно одна запись
+        count = _sql(path, "SELECT COUNT(*) FROM reports")[0][0]
+        assert count == 1
+
+    def test_get_latest_returns_last_payload_of_triple_any_hash(self, tmp_path):
+        # фолбэк «субтитры недоступны»: последний payload по тройке (по created_at)
+        # с любым content_hash — свежий хэш посчитать не из чего
+        store = Store(str(tmp_path / "db.sqlite3"))
+        try:
+            assert store.reports.get_latest("youtube:video:abc", "2", "blocks-1") is None
+
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "старый", content_hash="h1")
+            store.reports.put("youtube:video:abc", "2", "blocks-1", "новый", content_hash="h2")
+            assert store.reports.get_latest("youtube:video:abc", "2", "blocks-1") == "новый"
+
+            # изоляция по тройке: чужие версии промптов/видео не отдаются
+            store.reports.put("youtube:video:abc", "3", "blocks-1", "другая версия", content_hash="h3")
+            store.reports.put("youtube:video:xyz", "2", "blocks-1", "другое видео", content_hash="h4")
+            assert store.reports.get_latest("youtube:video:abc", "2", "blocks-1") == "новый"
+            assert store.reports.get_latest("youtube:video:abc", "3", "blocks-1") == "другая версия"
+            assert store.reports.get_latest("youtube:video:xyz", "2", "blocks-1") == "другое видео"
         finally:
             store.close()
 

@@ -1,29 +1,54 @@
-"""E2E-тесты in-process: полный путь «job -> субтитры -> LLM -> формат -> тред/буфер»
-без сети — fetch_transcript и LLM подменены, Discord-объекты — фейки из conftest.
+"""E2E-тесты in-process: полный путь «job -> субтитры -> LLM (JSON-отчёт) ->
+прогрессивный рендер -> тред/буфер» без сети — fetch_transcript и LLM подменены,
+Discord-объекты — фейки из conftest.
 
-Это «ходячий скелет» (walking skeleton): проверяет пользовательски видимое
-поведение (последовательность и формат сообщений в треде), а не внутренности.
-В отличие от монолита, зависимости передаются явно через Deps — глобальных
-подмен минимум (только fetch_transcript в bot.pipeline).
+Фаза 2: LLM отвечает JSON-структурой, пайплайн отправляет отчёт ПОСООБЩЕНИЯМ
+(кратко -> тезисы -> подробно по разделам); первое сообщение несёт заголовок
+«**Разбор: <ссылка>**», каждое сообщение отдельно режется чанк-сплиттером
+(fence-aware, (i/N) внутри одного сообщения); при сбое отправки в персистентный
+буфер уходит ПОЛНЫЙ хвост отчёта: остаток чанков текущего сообщения плюс ВСЕ
+последующие сообщения — конец разбора не теряется.
 """
 
 import asyncio
+import re
 from types import SimpleNamespace
 
 import discord
 
+from bot.analysis.report import Report, render_report_messages
 from bot.delivery import render
 from bot.pipeline import process_job
 
 VIDEO_ID = "abcdefghijk"
+LINK = f"https://youtu.be/{VIDEO_ID}"
 
-LONG_SUMMARY = (
-    "**Заголовок разбора**\n\n"
-    + "\n".join(f"- тезис {i}: " + "с" * 90 for i in range(12))
-    + "\n\n| Метрика | Значение |\n|---|---|\n| Длина | 42 мин |\n| Сложность | средняя |\n\n"
-    + "```python\n" + "\n".join(f"print({i})" for i in range(60)) + "\n```\n"
-    + "\n".join(f"абзац {i} подробностей " + "т" * 80 for i in range(20))
-)
+
+def _long_section_body(with_fence):
+    if not with_fence:
+        return "\n".join(f"абзац {j} подробностей " + "т" * 90 for j in range(25))
+    return (
+        "вступление раздела\n\n```python\n"
+        + "\n".join(f"print({n})" for n in range(250))
+        + "\n```\n"
+        + "завершение раздела"
+    )
+
+
+# Большой отчёт: тезисы сверх бюджета/порога, длинные разделы, в одном —
+# code-fence, чтобы упражнять fence-aware чанк-сплит внутри сообщения-раздела.
+BIG_ANALYSIS = {
+    "brief": "Суть видео в двух предложениях: о чём оно и зачем его смотреть.",
+    "complexity": "simple",
+    "context": "",
+    "theses": [f"тезис номер {i}: " + "с" * 90 for i in range(14)],
+    "sections": [
+        {"title": f"Раздел {i}", "start_sec": i * 700, "body": _long_section_body(i == 1)}
+        for i in range(6)
+    ],
+}
+
+MINIMAL_ANALYSIS = {"brief": "Коротко и ясно"}
 
 
 def _patch_transcript(monkeypatch, transcript="субтитры", exc=None):
@@ -51,47 +76,63 @@ class BrokenThread:
 
 
 class TestHappyPath:
-    def test_long_summary_chunked_and_formatted(self, monkeypatch, make_deps, make_thread, make_status, make_llm):
+    def test_block_report_delivered_progressively(
+        self, monkeypatch, make_deps, make_thread, make_status, make_llm
+    ):
         thread = make_thread(4242)
         status = make_status()
-        deps = make_deps(thread=thread, llm=make_llm(summary=LONG_SUMMARY))
+        deps = make_deps(thread=thread, llm=make_llm(analysis_json=BIG_ANALYSIS))
         _patch_transcript(monkeypatch)
 
         asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
 
-        assert thread.sent, "сообщения не отправлены"
-        assert all(len(c) <= deps.config.split_threshold for c in thread.sent)
-        if len(thread.sent) > 1:
-            assert thread.sent[0].endswith(f"(1/{len(thread.sent)})")
-        # GFM-таблицы конвертированы (сепараторов вне код-блоков нет)
-        assert not any("|---|" in c for c in thread.sent)
-        # код-блоки не разорваны: суммарно чётное число фенсов
-        fences = sum(c.count("\n```") + c.startswith("```") for c in thread.sent)
+        sent = thread.sent
+        assert sent, "сообщения не отправлены"
+        # порядок: кратко (с заголовком разбора) -> тезисы -> подробно по разделам
+        assert sent[0].startswith(f"**Разбор: {LINK}**\n\n**Кратко**")
+        idx_theses = next(n for n, c in enumerate(sent) if c.startswith("**Тезисы**"))
+        assert 0 < idx_theses
+        section_starts = [
+            next(n for n, c in enumerate(sent) if c.startswith(f"**Раздел {i}**")) for i in range(6)
+        ]
+        assert section_starts == sorted(section_starts)
+        assert all(s > idx_theses for s in section_starts)
+        # заголовок разбора ровно один — в первом сообщении
+        assert sum(c.count("**Разбор:") for c in sent) == 1
+        # все чанки в лимите Discord-сплита
+        assert all(len(c) <= deps.config.split_threshold for c in sent)
+        # длинные сообщения порезаны с индикаторами (i/N) внутри своего сообщения
+        assert any(re.search(r" \(\d+/\d+\)$", c) for c in sent)
+        # код-блоки не разорваны: суммарно чётное число фенсов, переоткрытие с языком
+        fences = sum(c.count("\n```") + c.startswith("```") for c in sent)
         assert fences % 2 == 0
-        # заголовок с ссылкой на видео присутствует
-        assert f"https://youtu.be/{VIDEO_ID}" in thread.sent[0]
+        assert any(c.startswith("```python") for c in sent)
+        # содержимое не потерялось: все разделы и хвост длинного раздела доставлены
+        assert all(f"**Раздел {i}**" in "".join(sent) for i in range(6))
+        assert "завершение раздела" in "".join(sent)
         assert status.deleted
         # транскрипт дошёл до LLM в неизменном виде
         assert deps.llm.calls == ["субтитры"]
 
-    def test_short_summary_single_message(self, monkeypatch, make_deps, make_thread, make_llm):
+    def test_minimal_report_single_message(self, monkeypatch, make_deps, make_thread, make_llm):
+        # отчёт только с brief: ровно одно сообщение — заголовок разбора + кратко
         thread = make_thread(4242)
-        deps = make_deps(thread=thread, llm=make_llm(summary="**Суть:** всё хорошо"))
+        deps = make_deps(thread=thread, llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)))
         _patch_transcript(monkeypatch)
 
         asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": None}))
 
-        assert len(thread.sent) == 1
+        assert thread.sent == [f"**Разбор: {LINK}**\n\n**Кратко**\n\nКоротко и ясно"]
 
-    def test_job_without_status_key_ok(self, monkeypatch, make_deps, make_thread):
+    def test_job_without_status_key_ok(self, monkeypatch, make_deps, make_thread, make_llm):
         # поле status в job опционально — его отсутствие не должно падать
         thread = make_thread(4242)
-        deps = make_deps(thread=thread)
+        deps = make_deps(thread=thread, llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)))
         _patch_transcript(monkeypatch)
 
         asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id}))
 
-        assert len(thread.sent) == 1
+        assert thread.sent == [f"**Разбор: {LINK}**\n\n**Кратко**\n\nКоротко и ясно"]
 
 
 class TestErrorPath:
@@ -151,29 +192,114 @@ class TestErrorPath:
         assert status.deleted
         assert disk_reads == [], "error-путь не должен перечитывать prompts.yaml"
 
+    def test_error_message_strips_mentions_from_reason(
+        self, monkeypatch, make_deps, make_thread, make_status, make_llm
+    ):
+        # LLM/провайдер могут вернуть текст с mention: фрагмент сырья уходит в
+        # {reason}, но бот не должен тегать людей в треде
+        thread = make_thread(4242)
+        status = make_status()
+        deps = make_deps(thread=thread, llm=make_llm(raw="@everyone сломалось, пинг <@123"))
+        _patch_transcript(monkeypatch)
+
+        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+
+        assert len(thread.sent) == 1
+        sent = thread.sent[0]
+        assert "сломалось" in sent, "причина ошибки попала в сообщение"
+        assert "@everyone" not in sent, "mention @everyone вырезан из {reason}"
+        assert "<@" not in sent, "начало <@-пинга вырезано из {reason}"
+        assert status.deleted
+
+
+class FailAfterThread:
+    """Тред: первые ok_sends отправок проходят, дальше — ретраебельная 5xx Discord."""
+
+    def __init__(self, id, ok_sends):
+        self.id = id
+        self.sent = []
+        self.ok_sends = ok_sends
+
+    async def send(self, content):
+        self.sent.append(content)
+        if len(self.sent) > self.ok_sends:
+            raise discord.HTTPException(SimpleNamespace(status=502, reason="x"), "boom")
+
+
+def _expected_chunks(deps):
+    """Зеркало контракта сборки сообщений: рендер отчёта -> префикс первого
+    сообщения -> чанк-сплит каждого сообщения по отдельности."""
+    report = Report.from_analysis(BIG_ANALYSIS)
+    msgs = render_report_messages(report, LINK, budgets=deps.prompts.get("budgets"))
+    msgs[0] = f"**Разбор: {LINK}**\n\n{msgs[0]}"
+    return [
+        render.truncate_message(render.format_for_discord(msg), deps.config.split_threshold)[
+            : deps.config.max_split_messages
+        ]
+        for msg in msgs
+    ]
+
 
 class TestOfflineDiscord:
-    def test_send_failure_buffers_all_chunks_in_order(
+    def test_send_failure_buffers_full_tail_of_report(
         self, monkeypatch, make_deps, make_client, make_status, make_llm
     ):
-        thread = BrokenThread(4242)
+        # кратко и тезисы доставлены; первое сообщение-раздел падает на первом
+        # чанке — в буфер уходит ПОЛНЫЙ хвост отчёта: все чанки упавшего сообщения
+        # плюс ВСЕ последующие сообщения, в порядке рендера (конец не теряется)
+        ok_sends = 2
+        thread = FailAfterThread(4242, ok_sends=ok_sends)
         status = make_status()
         deps = make_deps(
             client=make_client({4242: thread}),
-            llm=make_llm(summary=LONG_SUMMARY),
+            llm=make_llm(analysis_json=BIG_ANALYSIS),
         )
         _patch_transcript(monkeypatch)
 
         asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
 
-        # в буфер попали ровно те чанки, что должны были уйти, и в том же порядке
-        full = render.format_for_discord(f"**Тезисы: https://youtu.be/{VIDEO_ID}**\n\n{LONG_SUMMARY}")
-        expected = render.truncate_message(full, deps.config.split_threshold)[: deps.config.max_split_messages]
+        chunks_per_msg = _expected_chunks(deps)
+        flat = [c for chunks in chunks_per_msg for c in chunks]
+
+        # первые два сообщения доставлены целиком
+        assert thread.sent[:ok_sends] == flat[:ok_sends]
+        # упавший чанк — первый чанк следующего (многоблочного) сообщения-раздела
+        assert thread.sent[ok_sends] == chunks_per_msg[2][0]
+        # в буфере полный хвост: упавшее сообщение целиком + все последующие
         items = deps.outbox.load()
-        assert [i["content"] for i in items] == expected
-        assert len(items) > 1
+        buffered = [i["content"] for i in items]
+        assert buffered == chunks_per_msg[2] + [c for cs in chunks_per_msg[3:] for c in cs]
+        assert len(buffered) > len(chunks_per_msg[2]), "буферизованы и последующие сообщения отчёта"
+        # порядок: первый буферизованный — упавший чанк; последний содержит текст
+        # ПОСЛЕДНЕГО сообщения отчёта (хвост раздела 5) — конец разбора не потерян
+        assert buffered[0] == chunks_per_msg[2][0]
+        assert buffered[-1] == flat[-1]
+        assert "абзац 24 подробностей" in buffered[-1]
         assert all(i["thread_id"] == thread.id for i in items)
         # отправка не завершена — статусное сообщение остаётся
+        assert not status.deleted
+
+    def test_send_failure_on_first_chunk_buffers_entire_report(
+        self, monkeypatch, make_deps, make_client, make_status, make_llm
+    ):
+        # Discord лежит с самого начала: буферизуются ВСЕ чанки ВСЕХ сообщений
+        thread = FailAfterThread(4242, ok_sends=0)
+        status = make_status()
+        deps = make_deps(
+            client=make_client({4242: thread}),
+            llm=make_llm(analysis_json=BIG_ANALYSIS),
+        )
+        _patch_transcript(monkeypatch)
+
+        asyncio.run(process_job(deps, {"video_id": VIDEO_ID, "thread_id": thread.id, "status": status}))
+
+        flat = [c for chunks in _expected_chunks(deps) for c in chunks]
+
+        # каждая попытка ретрая падает на первом же чанке
+        assert thread.sent == [flat[0]] * deps.config.send_max_attempts
+        items = deps.outbox.load()
+        assert [i["content"] for i in items] == flat, "буфер — все чанки всех сообщений"
+        assert all(i["thread_id"] == thread.id for i in items)
         assert not status.deleted
 
     def test_flush_delivers_buffer_in_order(self, make_deps, make_thread):

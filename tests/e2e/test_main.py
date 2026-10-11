@@ -37,7 +37,7 @@ def test_build_deps_wires_real_components(tmp_path):
     deps = build_deps(config)
 
     assert deps.config is config
-    assert hasattr(deps.llm, "summarize")  # реальный LLMClient за портом .summarize
+    assert hasattr(deps.llm, "analyze_content")  # реальный LLMClient за портом .analyze_content
     assert isinstance(deps.outbox, DbOutbox)
     assert isinstance(deps.reports, ReportStore)
     assert isinstance(deps.sender, SafeSender)

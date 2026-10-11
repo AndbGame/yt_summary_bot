@@ -45,6 +45,8 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/unit/test_canonical.py` | формат canonical_id | `bot/sources/youtube.py` |
 | `tests/e2e/test_pipeline_cache.py` | кеш: промах/хит/перезапуск/смена версии промптов, ошибки не кешируются | `bot/pipeline.py`, `bot/store/reports.py` |
 | `tests/e2e/test_legacy_migration.py` | миграция pending_replies.json → БД: атомарный merge одной транзакцией, битые/кривые файлы → .corrupted | `bot/main.py` |
+| `tests/unit/test_report.py` | Report/ReportBlock: from_analysis, JSON roundtrip, терпеливый парсер, бюджеты, прогрессивный рендер (таймкоды, context, автор последним) | `bot/analysis/report.py` |
+| `tests/e2e/test_report_flow.py` | полный путь JSON-отчёта в тред, обрезка по бюджетам, мусор от LLM → error-промпт | `bot/pipeline.py`, `bot/analysis/report.py` |
 
 ## E2E in-process: как устроено
 

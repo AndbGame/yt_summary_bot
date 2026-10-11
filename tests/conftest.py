@@ -76,19 +76,42 @@ class FakeMessage:
         return self._thread
 
 
-class FakeLLM:
-    """Фейк deps.llm: возвращает заготовку или бросает ошибку; копит транскрипты."""
+# Дефолтный JSON-ответ LLM для фейка (фаза 2): валидный отчёт «кратко + тезисы».
+DEFAULT_ANALYSIS = {
+    "brief": "Короткая суть видео.",
+    "complexity": "simple",
+    "context": "",
+    "theses": ["первый тезис", "второй тезис"],
+    "sections": [],
+}
 
-    def __init__(self, summary="итог", error=None):
-        self.summary = summary
+
+class FakeLLM:
+    """Фейк deps.llm: analyze_content отдаёт Report из заготовленного JSON-ответа LLM.
+
+    analysis_json — ответ LLM в виде dict (собирается в Report тем же
+    Report.from_analysis, что и в LLMClient); raw — сырой ответ строкой:
+    парсится тем же терпеливым парсером, поэтому мусор даёт ReportParseError
+    (эмуляция «LLM вернул не JSON, попытки исчерпаны»); error — исключение
+    наружу как есть. Импорт bot.analysis.report ленивый: до реализации фазы 2
+    фейк не должен ломать КОЛЛЕКЦИЮ тестов, которым он не нужен (TDD).
+    """
+
+    def __init__(self, analysis_json=None, raw=None, error=None):
+        self.analysis_json = dict(DEFAULT_ANALYSIS) if analysis_json is None else analysis_json
+        self.raw = raw
         self.error = error
         self.calls = []
 
-    def summarize(self, transcript):
+    def analyze_content(self, transcript):
         self.calls.append(transcript)
         if self.error is not None:
             raise self.error
-        return self.summary
+        from bot.analysis.report import Report, parse_report_json  # лениво — см. докстринг
+
+        if self.raw is not None:
+            return parse_report_json(self.raw)
+        return Report.from_analysis(self.analysis_json)
 
 
 class FakeClient:
@@ -113,21 +136,38 @@ class FakeClient:
 
 
 class InMemoryReportStore:
-    """Фейк deps.reports (кеш отчётов): тот же интерфейс get/put, что у ReportStore.
+    """Фейк deps.reports (кеш отчётов): тот же интерфейс get/get_latest/put, что у
+    ReportStore фазы 2 — с content_hash в ключе.
 
-    Данные только в памяти; персистентность и схема БД проверяются отдельными
-    тестами настоящего Store (tests/unit/test_store.py). Нужен, чтобы все
-    существующие e2e-тесты работали с полем deps.reports без SQLite-файла.
+    Данные только в памяти; персистентность, схема БД и семантика совпадения
+    None-хэша с NULL/"" проверяются отдельными тестами настоящего Store
+    (tests/unit/test_store.py). Нужен, чтобы все существующие e2e-тесты работали
+    с полем deps.reports без SQLite-файла.
     """
 
     def __init__(self):
         self._reports = {}
 
-    def get(self, canonical_id, prompts_ver, schema_ver):
-        return self._reports.get((canonical_id, prompts_ver, schema_ver))
+    def get(self, canonical_id, prompts_ver, schema_ver, content_hash=None):
+        return self._reports.get((canonical_id, prompts_ver, schema_ver, content_hash))
 
-    def put(self, canonical_id, prompts_ver, schema_ver, payload):
-        self._reports[(canonical_id, prompts_ver, schema_ver)] = payload
+    def get_latest(self, canonical_id, prompts_ver, schema_ver):
+        """Последняя запись тройки (любой content_hash) — зеркало ReportStore.get_latest.
+
+        «Последняя» — по порядку put: перезапись двигает запись в конец, как
+        created_at у настоящего хранилища.
+        """
+        found = None
+        for key, payload in self._reports.items():
+            if key[:3] == (canonical_id, prompts_ver, schema_ver):
+                found = payload
+        return found
+
+    def put(self, canonical_id, prompts_ver, schema_ver, payload, content_hash=""):
+        key = (canonical_id, prompts_ver, schema_ver, content_hash)
+        # перезапись двигает запись в конец порядка вставки — аналог created_at
+        self._reports.pop(key, None)
+        self._reports[key] = payload
 
 
 # --------------------------------------------------------- фикстуры-фабрики
@@ -153,10 +193,10 @@ def make_message():
 
 @pytest.fixture
 def make_llm():
-    """Фабрика LLM-фейка: make_llm(summary="итог") или make_llm(error=exc)."""
+    """Фабрика LLM-фейка: make_llm(analysis_json={...}), make_llm(raw="...") или make_llm(error=exc)."""
 
-    def _make(summary="итог", error=None):
-        return FakeLLM(summary=summary, error=error)
+    def _make(analysis_json=None, raw=None, error=None):
+        return FakeLLM(analysis_json=analysis_json, raw=raw, error=error)
 
     return _make
 

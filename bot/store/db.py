@@ -12,9 +12,27 @@ from contextlib import contextmanager
 from bot.store.outbox import DbOutbox
 from bot.store.reports import ReportStore
 
-# Миграции схемы: ключ — целевая PRAGMA user_version, значение — DDL шага.
+
+def _add_reports_content_hash(conn) -> None:
+    """Шаг 2 (фаза 2): колонка content_hash в reports — часть ключа кеша.
+
+    ALTER TABLE в sqlite не умеет IF NOT EXISTS, а свежая база уже получает
+    колонку от шага 1 — поэтому проверяем PRAGMA table_info и добавляем только
+    при отсутствии (легаси-база фазы 1). Колонка nullable: ALTER с NOT NULL
+    в sqlite требует непустой DEFAULT, а легаси-строки должны остаться читаемыми
+    (пустой хэш трактуется как «запись без content_hash», см. ReportStore.get).
+    """
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(reports)")]
+    if "content_hash" not in columns:
+        conn.execute("ALTER TABLE reports ADD COLUMN content_hash TEXT")
+
+
+# Миграции схемы: ключ — целевая PRAGMA user_version, значение — DDL шага
+# (строка) или функция от соединения (когда одного SQL недостаточно).
 # Новая версия схемы = новый шаг с большим номером; старые не переписывать.
 _MIGRATIONS = {
+    # шаг 1 обновлён фазой 2: свежая БД создаётся сразу с content_hash;
+    # для легаси — шаг 2 добавляет колонку ALTER'ом
     1: """
         CREATE TABLE IF NOT EXISTS reports (
             canonical_id TEXT NOT NULL,
@@ -22,6 +40,7 @@ _MIGRATIONS = {
             schema_ver   TEXT NOT NULL,
             payload      TEXT NOT NULL,
             created_at   INTEGER NOT NULL,
+            content_hash TEXT,
             PRIMARY KEY (canonical_id, prompts_ver, schema_ver)
         );
 
@@ -34,6 +53,7 @@ _MIGRATIONS = {
             created_at INTEGER NOT NULL
         );
     """,
+    2: _add_reports_content_hash,
 }
 
 
@@ -65,9 +85,12 @@ class Store:
         if version >= max(_MIGRATIONS):
             return
         with self._lock:
-            for target, ddl in sorted(_MIGRATIONS.items()):
+            for target, step in sorted(_MIGRATIONS.items()):
                 if version < target:
-                    self._conn.executescript(ddl)
+                    if callable(step):
+                        step(self._conn)
+                    else:
+                        self._conn.executescript(step)
                     self._conn.execute(f"PRAGMA user_version = {target}")
             self._conn.commit()
 
