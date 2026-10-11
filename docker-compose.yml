@@ -1,0 +1,14 @@
+services:
+  yt-summary-bot:
+    build: .
+    image: yt-summary-bot:latest
+    container_name: yt_summary_bot
+    restart: unless-stopped
+    # host-сеть: трафик идёт напрямую через стек Windows и попадает под zapret,
+    # иначе DPI рвёт TLS к discord.com (TCP есть, handshake виснет)
+    network_mode: host
+    env_file: .env
+    volumes:
+      # код монтируется с хоста: entrypoint при старте делает git pull,
+      # так что "самообновление из GitHub" = docker compose restart
+      - .:/app

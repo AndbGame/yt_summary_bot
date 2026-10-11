@@ -72,6 +72,25 @@ def extract_video_id(text: str):
     return m.group(1), m.start(), m.end()
 
 
+async def find_existing_thread(message: discord.Message):
+    """Ищет тред, созданный из этого сообщения (его id == message.id).
+
+    Нужно после перезапуска бота: тред мог быть создан прошлым запуском,
+    а in-memory дедуп потерян — Discord не даст создать второй тред (160004).
+    """
+    ch = message.channel
+    for t in list(getattr(ch, "threads", []) or []):
+        if t.id == message.id:
+            return t
+    try:
+        async for t in ch.archived_threads(limit=50):
+            if t.id == message.id:
+                return t
+    except discord.HTTPException:
+        pass
+    return None
+
+
 def fetch_transcript(video_id: str) -> str:
     """Скачивает субтитры (ru -> en -> любые), возвращает текст с таймкодами."""
     api = youtube_transcript_api.YouTubeTranscriptApi()
@@ -156,10 +175,16 @@ async def handle(message: discord.Message):
             await status.edit(content="⚠️ Нет прав создать тред в этом канале.")
         return
     except discord.HTTPException as e:
-        log.error("не смог создать тред: %s", e)
-        if status:
-            await status.edit(content="⚠️ Не удалось создать тред (лимиты Discord?).")
-        return
+        # 160004: тред под этим сообщением уже есть (создан до рестарта бота
+        # или вторым источником события) — переиспользуем, не сдаёмся
+        if getattr(e, "code", None) == 160004 or "160004" in str(e):
+            thread = await find_existing_thread(message)
+        if thread is None:
+            log.error("не смог создать тред: %s", e)
+            if status:
+                await status.edit(content="⚠️ Не удалось создать тред (лимиты Discord?).")
+            return
+        log.info("тред уже существует, пишу в него: %s", thread.id)
 
     # субтитры + LLM в отдельном потоке, чтобы не висел event loop
     try:
