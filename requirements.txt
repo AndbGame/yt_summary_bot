@@ -2,3 +2,4 @@ discord.py>=2.4
 requests>=2.31
 youtube-transcript-api>=1.0
 openai>=1.40
+pyyaml>=6.0
