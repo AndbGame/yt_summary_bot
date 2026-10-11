@@ -367,6 +367,12 @@ class ArticleExtractor:
         """«article:<norm-url>» — ключ кеша отчётов (нормализация в докстринге модуля)."""
         return f"article:{_normalize_url(url)}"
 
+    def describe(self, url: str) -> tuple[str, str] | None:
+        """Для статьи метаданных без полного fetch не достать — а он повторится
+        в extract. None: тред зовётся по тексту сообщения, заголовок разбора
+        строится пайплайном из маскированной ссылки."""
+        return None
+
     def extract(self, url: str) -> SourceDocument:
         """Страница -> SourceDocument(kind="article"); сбой добычи — исключение наружу."""
         fetched = self._fetch(url, _TIMEOUT)

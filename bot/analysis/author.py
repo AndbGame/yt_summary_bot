@@ -45,6 +45,9 @@ _CONTENT_RE = re.compile(r"""content\s*=\s*["'](.*?)["']""", re.IGNORECASE | re.
 _YOUTUBE_SUFFIX = " - YouTube"
 
 
+_DEFAULT_FETCH = None  # присваивается сразу после определения: oembed_meta зовёт до инжекта
+
+
 def fetch(url: str, timeout: float = _TIMEOUT) -> tuple[int, str] | None:
     """Дефолтный fetch: (status_code, text) или None при любой сетевой ошибке.
 
@@ -57,6 +60,29 @@ def fetch(url: str, timeout: float = _TIMEOUT) -> tuple[int, str] | None:
         log.warning("fetch %s упал: %s", url, e)
         return None
     return resp.status_code, resp.text
+
+
+_DEFAULT_FETCH = fetch
+
+
+def oembed_meta(url: str, fetch=None) -> dict | None:
+    """oEmbed-метаданные YouTube-ссылки: {title, author_name, author_url, …}.
+
+    Общая точка для get_author_ref (ref по каналу) и YoutubeExtractor.describe
+    (title/автор для имени треда и заголовка). Любой сбой сети/парса — None.
+    """
+    fetch = fetch or _DEFAULT_FETCH
+    fetched = fetch(f"{_OEMBED_URL}?{urlencode({'url': url, 'format': 'json'})}", _TIMEOUT)
+    if fetched is None:
+        return None
+    status, text = fetched
+    if not 200 <= status < 300:
+        return None
+    try:
+        data = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # Алиас нужен, потому что параметр __init__ провайдера называется fetch и
@@ -160,22 +186,8 @@ class YouTubeAuthorFactsProvider:
             return None
 
     def _get_author_ref(self, url: str) -> AuthorRef | None:
-        fetched = self._fetch(
-            f"{_OEMBED_URL}?{urlencode({'url': url, 'format': 'json'})}",
-            _TIMEOUT,
-        )
-        if fetched is None:
-            return None
-        status, text = fetched
-        if not 200 <= status < 300:
-            return None
-        try:
-            data = json.loads(text)
-        except (TypeError, json.JSONDecodeError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        author_url = data.get("author_url")
+        data = oembed_meta(url, fetch=self._fetch)
+        author_url = (data or {}).get("author_url")
         if not author_url or not isinstance(author_url, str):
             return None
         handle = _handle_from_url(author_url)

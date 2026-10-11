@@ -286,6 +286,8 @@ class FakeExtractor:
     совпадения, иначе ищется первый http(s)-URL в тексте. Контракт порта:
     find(text) -> (start, end) | None — основной метод (границы для Router),
     matches(url) производен от find; canonical_id детерминирован по url.
+    describe_result — (title, author) для describe (UX-итерация: имя треда и
+    заголовок без ссылок); None или describe_error — describe вернёт None.
     Вызовы extract считаются — e2e кеша проверяет «контент добывается всегда,
     но LLM на хите не зовётся».
     """
@@ -295,13 +297,22 @@ class FakeExtractor:
     _URL_RE = re.compile(r"https?://\S+")
 
     def __init__(
-        self, transcripts=None, extract_error=None, find_span=None, default_transcript="субтитры"
+        self,
+        transcripts=None,
+        extract_error=None,
+        find_span=None,
+        default_transcript="субтитры",
+        describe_result=None,
+        describe_error=None,
     ):
         self.transcripts = dict(transcripts or {})
         self.extract_error = extract_error
         self.find_span = find_span
         self.default_transcript = default_transcript
         self.extract_calls = []
+        self.describe_result = describe_result
+        self.describe_error = describe_error
+        self.describe_calls = []
 
     def find(self, text):
         if self.find_span is not None:
@@ -317,6 +328,12 @@ class FakeExtractor:
 
     def canonical_id(self, url):
         return f"video:{url}"
+
+    def describe(self, url):
+        self.describe_calls.append(url)
+        if self.describe_error is not None:
+            raise self.describe_error
+        return self.describe_result
 
     def extract(self, url):
         from bot.sources.base import SourceDocument  # лениво: TDD фазы 4

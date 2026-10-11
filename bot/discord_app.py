@@ -35,12 +35,16 @@ def create_client() -> discord.Client:
     return discord.Client(intents=default_intents())
 
 
-def thread_name_from_message(text: str, route) -> str:
-    """Имя треда: текст сообщения без ссылки (срез границ роутера).
+def thread_name_from_message(text: str, route, title: str = "", author: str = "") -> str:
+    """Имя треда без ссылок: «Название (Автор)», если экстрактор дал describe.
 
-    Осталось пусто (сообщение было только ссылкой) — «Разбор <url>»; лимит
-    Discord — 100 символов, режем до 90 с запасом.
+    Иначе — текст сообщения без ссылки (срез границ роутера); если и там пусто
+    (сообщение было только ссылкой) — «Разбор <url>». Лимит Discord — 100
+    символов, режем до 90 с запасом.
     """
+    if title:
+        named = f"{title} ({author})" if author else title
+        return named[:90]
     stripped = re.sub(r"\s+", " ", (text[: route.start] + text[route.end :])).strip()
     return stripped[:90] if stripped else f"Разбор {route.url}"[:90]
 
@@ -117,9 +121,20 @@ async def handle(message: discord.Message, deps) -> None:
     except discord.HTTPException:
         pass
 
+    # describe: название/автор для имени треда и заголовка разбора (без ссылок).
+    # Сеть — в поток; сбой не фатален: тред и заголовок будут из запасных вариантов
+    display_title = display_author = ""
+    try:
+        meta = await asyncio.to_thread(route.extractor.describe, url)
+    except Exception:
+        log.warning("describe %s не удался", url, exc_info=True)
+        meta = None
+    if meta:
+        display_title, display_author = meta
+
     try:
         thread = await message.create_thread(
-            name=thread_name_from_message(message.content, route),
+            name=thread_name_from_message(message.content, route, display_title, display_author),
             auto_archive_duration=1440,
         )
     except discord.Forbidden:
@@ -155,6 +170,8 @@ async def handle(message: discord.Message, deps) -> None:
         "thread_id": thread.id,
         "message_id": message.id,
         "status_message_id": status.id if status else None,
+        "display_title": display_title,
+        "display_author": display_author,
     }
     jobs = getattr(deps, "jobs", None)
     try:

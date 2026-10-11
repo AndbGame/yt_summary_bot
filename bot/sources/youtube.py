@@ -75,8 +75,10 @@ class YoutubeExtractor:
 
     name = "video"
 
-    def __init__(self, fetch_transcript=None):
+    def __init__(self, fetch_transcript=None, oembed=None):
         self._fetch_transcript = fetch_transcript or _DEFAULT_FETCH_TRANSCRIPT
+        # oEmbed-метаданные для describe (в тестах инжектится фейк)
+        self._oembed = oembed
 
     def find(self, text: str) -> tuple[int, int] | None:
         """Границы первой YouTube-ссылки в тексте или None."""
@@ -91,6 +93,29 @@ class YoutubeExtractor:
         """«youtube:video:<id>» по ссылке или None, если ссылка не YouTube."""
         found = extract_video_id(url)
         return canonical_video_id(found[0]) if found else None
+
+    def describe(self, url: str) -> tuple[str, str] | None:
+        """(title, author_name) по oEmbed — имя треда и заголовок без ссылок.
+
+        Один быстрый запрос без ключа; любой сбой — None (тред тогда зовётся
+        по тексту сообщения), экстракция это не блокирует.
+        """
+        from bot.analysis.author import oembed_meta  # лениво: youtube -> author -> base
+
+        if not self.matches(url or ""):
+            return None
+        try:
+            data = (self._oembed or oembed_meta)(url)
+        except Exception:
+            log.warning("describe %s упал", url, exc_info=True)
+            return None
+        if not data:
+            return None
+        title = data.get("title") or ""
+        author = data.get("author_name") or ""
+        if not title:
+            return None
+        return title, author
 
     def extract(self, url: str) -> SourceDocument:
         """Субтитры -> SourceDocument; сбой добычи контента — исключение наружу."""

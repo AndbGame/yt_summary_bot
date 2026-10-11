@@ -84,6 +84,9 @@ def _duck_with_find():
         def extract(self, url):
             raise AssertionError("не вызывается")
 
+        def describe(self, url):
+            return None
+
     return _Duck()
 
 

@@ -242,6 +242,6 @@ class TestJobLifecycleInDb:
         _drain(deps)
 
         assert thread.sent, "восстановленная джоба обработана"
-        assert thread.sent[0].startswith(f"**Разбор: {URL}**"), "отчёт доставлен в тред"
+        assert thread.sent[0].startswith(f"**Разбор: <{URL}>**"), "отчёт доставлен в тред"
         assert status.deleted, "статусное сообщение закрыто"
         assert deps.jobs.count_new() == 0, "джоба завершена, повторного восстановления нет"

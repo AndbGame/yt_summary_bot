@@ -58,7 +58,7 @@ class TestExtractVideoId:
 
 
 class TestYoutubeExtractor:
-    """Экстрактор за портом: find/matches/canonical_id/extract; DI транскрипта."""
+    """Экстрактор за портом: find/matches/canonical_id/describe/extract; DI транскрипта."""
 
     URL = "https://youtu.be/abcdefghijk"
     VIDEO_ID = "abcdefghijk"
@@ -96,6 +96,27 @@ class TestYoutubeExtractor:
         extractor = self._extractor()
         for text in ("", "https://vimeo.com/12345", "просто текст"):
             assert extractor.matches(text) is False, repr(text)
+
+    def test_describe_returns_title_and_author(self):
+        from bot.sources.youtube import YoutubeExtractor
+
+        extractor = YoutubeExtractor(oembed=lambda url: {"title": "Призмы анимо", "author_name": "Мир Aniimo"})
+        assert extractor.describe(self.URL) == ("Призмы анимо", "Мир Aniimo")
+
+    def test_describe_none_without_title_or_for_non_youtube(self):
+        from bot.sources.youtube import YoutubeExtractor
+
+        no_title = YoutubeExtractor(oembed=lambda url: {"author_name": "Кто-то"})
+        assert no_title.describe(self.URL) is None
+        # не-YouTube ссылка — None без сети (oembed не зовётся)
+        untouched = YoutubeExtractor(oembed=lambda url: (_ for _ in ()).throw(AssertionError("сеть!")))
+        assert untouched.describe("https://example.com/news") is None
+
+    def test_describe_failure_is_none(self):
+        from bot.sources.youtube import YoutubeExtractor
+
+        extractor = YoutubeExtractor(oembed=lambda url: (_ for _ in ()).throw(RuntimeError("сеть")))
+        assert extractor.describe(self.URL) is None
 
     def test_matches_is_derived_from_find(self):
         # зафиксировано контрактом фазы 4: matches(url) == (find(url) is not None)

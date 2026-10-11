@@ -77,3 +77,10 @@ class ExtractorPort(Protocol):
     def extract(self, url: str) -> SourceDocument:
         """Добывает контент; сбой добычи — исключение наружу."""
         ...
+
+    def describe(self, url: str) -> tuple[str, str] | None:
+        """Человекочитаемые метаданные (title, author) для имени треда и
+        заголовка разбора — без ссылок. Может требовать сеть (зовётся из
+        handle один раз, не в hot path); любой сбой — None, экстракция
+        позже всё равно отработает."""
+        ...

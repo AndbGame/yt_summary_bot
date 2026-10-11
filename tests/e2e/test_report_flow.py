@@ -70,15 +70,14 @@ class TestProgressiveDelivery:
         asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
         sent = thread.sent
-        # порядок сообщений: [кратко(+контекст), тезисы, разделы...]
+        # порядок сообщений: [кратко(+контекст), тезисы, разделы одной пачкой]
         assert [s.split("\n")[0] for s in sent] == [
-            f"**Разбор: {LINK}**",
+            f"**Разбор: <{LINK}>**",
             "**Тезисы**",
             "**Установка**",
-            "**Настройка**",
         ]
         # сообщение 1: заголовок разбора + кратко + метка сложности + контекст
-        assert sent[0].startswith(f"**Разбор: {LINK}**\n\n**Кратко**\n\nВидео про настройку домашнего сервера.")
+        assert sent[0].startswith(f"**Разбор: <{LINK}>**\n\n**Кратко**\n\nВидео про настройку домашнего сервера.")
         assert "⚠️ Узкоспециальная тема." in sent[0]
         assert "> *Простыми словами:* это пошаговая инструкция по установке, объяснённая для новичков" in sent[0]
         # метка сложности идёт ДО контекста, но после краткого
@@ -86,11 +85,12 @@ class TestProgressiveDelivery:
         assert sent[0].index("⚠️") < sent[0].index("*Простыми словами:*")
         # сообщение 2: тезисы
         assert sent[1] == "**Тезисы**\n\n- первый тезис\n- второй тезис\n- третий тезис"
-        # далее разделы с таймкод-ссылками (mm:ss и h:mm:ss)
-        assert sent[2].startswith(f"**Установка**\n\n[01:15]({LINK}?t=75)")
+        # разделы упакованы в одно сообщение (компактность), таймкод-ссылки
+        # маскированы <url> — иначе Discord на каждый тайминг рисует превью
+        assert sent[2].startswith(f"**Установка**\n\n[01:15](<{LINK}?t=75>)")
         assert "Шаги установки системы." in sent[2]
-        assert f"[1:01:15]({LINK}?t=3675)" in sent[3]
-        assert "Разбор параметров конфига." in sent[3]
+        assert f"[1:01:15](<{LINK}?t=3675>)" in sent[2]
+        assert "Разбор параметров конфига." in sent[2]
 
         assert status.deleted
         assert deps.llm.calls == ["субтитры"]
@@ -117,7 +117,7 @@ class TestProgressiveDelivery:
         assert len(thread.sent) == 2
         first = thread.sent[0]
         # brief обрезан до бюджета и помечен маркером; полный текст не ушёл в тред
-        assert first.startswith(f"**Разбор: {LINK}**\n\n**Кратко**\n\n{'Б' * 20}")
+        assert first.startswith(f"**Разбор: <{LINK}>**\n\n**Кратко**\n\n{'Б' * 20}")
         assert first.endswith(" …(обрезано)")
         assert "Б" * 60 not in first
         # тезисы в бюджете — не обрезаны

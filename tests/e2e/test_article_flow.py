@@ -120,9 +120,10 @@ class TestArticleFlow:
 
         _run_worker_once(deps)
 
-        # тред получил «Разбор» + блоки прогрессивной детализации
+        # тред получил «Разбор» + блоки прогрессивной детализации; у статей нет
+        # describe-метаданных — заголовок из маскированной ссылки (без превью)
         assert thread.sent, "сообщения не отправлены"
-        assert thread.sent[0].startswith(f"**Разбор: {ARTICLE_URL}**\n\n**Кратко**")
+        assert thread.sent[0].startswith(f"**Разбор: <{ARTICLE_URL}>**\n\n**Кратко**")
         sent_text = "\n".join(thread.sent)
         assert "**Тезисы**" in sent_text
         assert "**Заголовок раздела**" in sent_text, "подробно по разделам на месте"

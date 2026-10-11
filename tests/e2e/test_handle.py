@@ -224,6 +224,51 @@ class TestThreadName:
 
         assert len(msg.thread_kwargs["name"]) <= 90
 
+    def test_describe_names_thread_without_link(
+        self, make_deps, make_message, make_thread, make_extractor, make_router
+    ):
+        # UX-итерация: имя треда = «Название (Автор)», ссылок в имени нет
+        extractor = make_extractor(describe_result=("Призмы анимо: главный секрет", "Мир Aniimo"))
+        deps = make_deps(router=make_router([extractor]))
+        msg = make_message(URL, thread=make_thread(555))
+
+        asyncio.run(handle(msg, deps))
+
+        name = msg.thread_kwargs["name"]
+        assert name == "Призмы анимо: главный секрет (Мир Aniimo)"
+        assert "youtu" not in name and VIDEO_ID not in name
+        assert extractor.describe_calls == [URL], "describe зовётся по url джобы"
+        # метаданные едут в джобе — заголовок разбора построит пайплайн
+        job = asyncio.run(deps.queue.get())
+        assert job["display_title"] == "Призмы анимо: главный секрет"
+        assert job["display_author"] == "Мир Aniimo"
+
+    def test_describe_failure_falls_back_to_message_text(
+        self, make_deps, make_message, make_thread, make_extractor, make_router
+    ):
+        extractor = make_extractor(describe_error=RuntimeError("сеть лежит"))
+        deps = make_deps(router=make_router([extractor]))
+        msg = make_message(f"смотрите {URL} шедевр", thread=make_thread(555))
+
+        asyncio.run(handle(msg, deps))
+
+        name = msg.thread_kwargs["name"]
+        assert "смотрите" in name and "шедевр" in name
+        job = asyncio.run(deps.queue.get())
+        assert job["display_title"] == "" and job["display_author"] == ""
+
+    def test_describe_none_uses_message_text_too(
+        self, make_deps, make_message, make_thread, make_extractor, make_router
+    ):
+        # экстрактор без метаданных (статья) — старое поведение по тексту сообщения
+        extractor = make_extractor(describe_result=None)
+        deps = make_deps(router=make_router([extractor]))
+        msg = make_message(f"почитай {URL} к вечернему", thread=make_thread(555))
+
+        asyncio.run(handle(msg, deps))
+
+        assert "почитай" in msg.thread_kwargs["name"]
+
 
 class _FailingPutJobStore:
     """Джоба-стор с падающим put: БД недоступна (P3-3). put не пишет строку,

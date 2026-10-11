@@ -260,14 +260,49 @@ class TestRenderMessages:
     def test_full_report_message_order(self):
         report = Report.from_analysis(FULL_ANALYSIS)
         msgs = render_report_messages(report, URL)
-        # кратко(+контекст) -> тезисы -> по сообщению на раздел
+        # кратко(+контекст) -> тезисы -> разделы упакованы в ОДНО сообщение
+        # (компактность: один пост на тайминг — шум в канале)
         assert msgs[0] == (
             "**Кратко**\n\nСуть видео.\n\n> *Простыми словами:* это разбор устройства сервера для новичков"
         )
         assert msgs[1] == "**Тезисы**\n\n- тезис один\n- тезис два"
         assert msgs[2].startswith("**Вступление**")
-        assert msgs[3] == "**Детали**\n\nтело деталей"
-        assert len(msgs) == 4
+        assert "**Детали**\n\nтело деталей" in msgs[2]
+        assert len(msgs) == 3
+
+    def test_sections_packed_into_one_message_when_fit(self):
+        # компактность: три коротких раздела — одно сообщение, а не три поста
+        report = Report.from_analysis(
+            {
+                "brief": "Б",
+                "sections": [
+                    {"title": "S1", "body": "а"},
+                    {"title": "S2", "body": "б"},
+                    {"title": "S3", "body": "в"},
+                ],
+            }
+        )
+        msgs = render_report_messages(report, URL)
+        assert len(msgs) == 2
+        assert "**S1**" in msgs[1] and "**S2**" in msgs[1] and "**S3**" in msgs[1]
+        assert msgs[1].index("**S1**") < msgs[1].index("**S2**") < msgs[1].index("**S3**")
+
+    def test_sections_split_when_exceeding_budget(self):
+        # в пачку набирается до section_budget; превышение — новое сообщение
+        report = Report.from_analysis(
+            {
+                "brief": "Б",
+                "sections": [
+                    {"title": "S1", "body": "а" * 600},
+                    {"title": "S2", "body": "б" * 600},
+                    {"title": "S3", "body": "в" * 600},
+                ],
+            }
+        )
+        packed = render_report_messages(report, URL, section_budget=700)[1:]
+        assert len(packed) == 3
+        for message in packed:
+            assert len(message) <= 700
 
     def test_specialized_adds_warning_line_before_context(self):
         report = Report.from_analysis(
@@ -297,15 +332,17 @@ class TestRenderMessages:
             {"brief": "Б", "sections": [{"title": "S", "start_sec": 75, "body": "б"}]}
         )
         msg = render_report_messages(report, URL)[1]
-        assert msg.startswith(f"**S**\n\n[01:15]({URL}?t=75)")
-        assert msg.index(f"[01:15]({URL}?t=75)") < msg.index("б")
+        # ссылка маскируется <url>: без этого Discord на каждый тайминг рисует
+        # превью-встройку видео
+        assert msg.startswith(f"**S**\n\n[01:15](<{URL}?t=75>)")
+        assert msg.index(f"[01:15](<{URL}?t=75>)") < msg.index("б")
 
     def test_start_sec_becomes_hours_link(self):
         report = Report.from_analysis(
             {"brief": "Б", "sections": [{"title": "S", "start_sec": 3675, "body": "б"}]}
         )
         msg = render_report_messages(report, URL)[1]
-        assert f"[1:01:15]({URL}?t=3675)" in msg
+        assert f"[1:01:15](<{URL}?t=3675>)" in msg
 
     def test_start_sec_zero_still_links_to_beginning(self):
         # 0 секунд — валидный таймкод начала видео: ссылка со ?t=0, метка 00:00
@@ -313,7 +350,7 @@ class TestRenderMessages:
             {"brief": "Б", "sections": [{"title": "S", "start_sec": 0, "body": "б"}]}
         )
         msg = render_report_messages(report, URL)[1]
-        assert f"[00:00]({URL}?t=0)" in msg
+        assert f"[00:00](<{URL}?t=0>)" in msg
 
     def test_section_without_start_sec_no_link(self):
         report = Report.from_analysis({"brief": "Б", "sections": [{"title": "S", "body": "б"}]})

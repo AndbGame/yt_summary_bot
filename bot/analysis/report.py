@@ -206,17 +206,23 @@ def validate_budgets(report: Report, budgets: dict | None) -> list[str]:
     return warnings
 
 
-def render_report_messages(report: Report, url: str, budgets: dict | None = None) -> list[str]:
+def render_report_messages(
+    report: Report, url: str, budgets: dict | None = None, section_budget: int = 1900
+) -> list[str]:
     """Прогрессивный рендер: кратко (+контекст) -> тезисы -> разделы -> автор.
 
     Правила границ ответственности:
-    - заголовок разбора «**Разбор: <ссылка>**» добавляет pipeline (он знает
-      ссылку-источник), не рендер;
-    - detailed-блоки не режутся: их режет чанк-сплиттер пайплайна с
-      fence-восстановлением, бюджета здесь недостаточно;
+    - заголовок разбора «**Разбор: Название (Автор)**» добавляет pipeline
+      (он знает метаданные джобы), не рендер;
+    - detailed-блоки УПАКОВЫВАЮТСЯ в как можно меньше сообщений (лимит
+      section_budget на сообщение): один пост на тайминг — шум, читатель
+      хочет компактный разбор; одиночное длинное сообщение дальше режет
+      чанк-сплиттер пайплайна с fence-восстановлением;
     - brief/context/theses укорачиваются до бюджетов с маркером — это уже
       финальный вид, чанк-сплиттеру резать их не потребуется;
-    - автор — последний независимо от позиции блока: финальный контекст.
+    - автор — последний независимо от позиции блока: финальный контекст;
+    - ссылки таймкодов маскируются <url>: иначе Discord рисует на каждый
+      тайминг превью-встройку видео.
     """
     brief = next((b for b in report.blocks if b.kind == "brief"), None)
     context = next((b for b in report.blocks if b.kind == "context"), None)
@@ -236,12 +242,25 @@ def render_report_messages(report: Report, url: str, budgets: dict | None = None
     if theses is not None:
         messages.append(f"**Тезисы**\n\n{_fit(theses.body_md, budgets, 'theses')}")
 
+    packed: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
     for block in report.blocks:
         if block.kind != "detailed":
             continue
         link = _time_link(block.data.get("start_sec"), url)
         body = f"{link}\n\n{block.body_md}" if link else block.body_md
-        messages.append(f"**{block.title}**\n\n{body}")
+        part = f"**{block.title}**\n\n{body}"
+        # грубая упаковка по символам: точную подгонку всё равно делает
+        # чанк-сплиттер, здесь важно не плодить сообщения
+        if buf and buf_len + len(part) + 2 > section_budget:
+            packed.append("\n\n".join(buf))
+            buf, buf_len = [], 0
+        buf.append(part)
+        buf_len += len(part) + 2
+    if buf:
+        packed.append("\n\n".join(buf))
+    messages.extend(packed)
 
     author = next((b for b in report.blocks if b.kind == "author"), None)
     if author is not None:
@@ -266,7 +285,11 @@ def _fit(body: str, budgets: dict | None, budget_key: str) -> str:
 
 
 def _time_link(start_sec, url: str) -> str | None:
-    """Таймкод -> кликабельная метка [mm:ss](url?t=<sec>); 0 секунд — валиден."""
+    """Таймкод -> кликабельная метка [mm:ss](<url?t=<sec>>); 0 секунд — валиден.
+
+    URL обёрнут в <…>: без этого Discord на каждый тайминг рисует превью-встройку
+    видео — разбор превращается в ленту карточек.
+    """
     try:
         sec = int(start_sec)
     except (TypeError, ValueError):
@@ -276,4 +299,4 @@ def _time_link(start_sec, url: str) -> str | None:
     minutes, seconds = divmod(sec, 60)
     hours, minutes = divmod(minutes, 60)
     label = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
-    return f"[{label}]({url}?t={sec})"
+    return f"[{label}](<{url}?t={sec}>)"

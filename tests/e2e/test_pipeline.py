@@ -101,7 +101,7 @@ class TestHappyPath:
         sent = thread.sent
         assert sent, "сообщения не отправлены"
         # порядок: кратко (с заголовком разбора) -> тезисы -> подробно по разделам
-        assert sent[0].startswith(f"**Разбор: {LINK}**\n\n**Кратко**")
+        assert sent[0].startswith(f"**Разбор: <{LINK}>**\n\n**Кратко**")
         idx_theses = next(n for n, c in enumerate(sent) if c.startswith("**Тезисы**"))
         assert 0 < idx_theses
         section_starts = [
@@ -141,7 +141,7 @@ class TestHappyPath:
 
         asyncio.run(process_job(deps, _job(extractor, thread.id, status=None)))
 
-        assert thread.sent == [f"**Разбор: {LINK}**\n\n**Кратко**\n\nКоротко и ясно"]
+        assert thread.sent == [f"**Разбор: <{LINK}>**\n\n**Кратко**\n\nКоротко и ясно"]
 
     def test_job_without_status_key_ok(self, make_deps, make_thread, make_llm, make_extractor, make_router):
         # поле status в job опционально — его отсутствие не должно падать
@@ -155,7 +155,67 @@ class TestHappyPath:
 
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
-        assert thread.sent == [f"**Разбор: {LINK}**\n\n**Кратко**\n\nКоротко и ясно"]
+        assert thread.sent == [f"**Разбор: <{LINK}>**\n\n**Кратко**\n\nКоротко и ясно"]
+
+    def test_header_uses_display_metadata_without_link(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router
+    ):
+        # UX-итерация: заголовок «Разбор: Название (Автор)» — без ссылки
+        # (голый URL даёт превью-встройку в Discord)
+        thread = make_thread(4242)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        job = _job(
+            extractor, thread.id, status=None,
+            display_title="Призмы анимо", display_author="Мир Aniimo",
+        )
+
+        asyncio.run(process_job(deps, job))
+
+        assert thread.sent == ["**Разбор: Призмы анимо (Мир Aniimo)**\n\n**Кратко**\n\nКоротко и ясно"]
+        assert LINK not in thread.sent[0], "ссылки в заголовке нет"
+
+    def test_header_clips_long_title_keeps_author(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router
+    ):
+        from bot.pipeline import TITLE_CLIP
+
+        thread = make_thread(4242)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        job = _job(
+            extractor, thread.id, status=None,
+            display_title="Б" * (TITLE_CLIP + 10), display_author="Канал",
+        )
+
+        asyncio.run(process_job(deps, job))
+
+        header = thread.sent[0].split("\n")[0]
+        assert header == f"**Разбор: {'Б' * TITLE_CLIP}… (Канал)**"
+
+    def test_header_without_author_title_only(
+        self, make_deps, make_thread, make_llm, make_extractor, make_router
+    ):
+        thread = make_thread(4242)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        job = _job(extractor, thread.id, status=None, display_title="Название", display_author="")
+
+        asyncio.run(process_job(deps, job))
+
+        assert thread.sent[0].startswith("**Разбор: Название**\n\n")
 
 
 class TestErrorPath:
@@ -315,7 +375,7 @@ def _expected_chunks(deps):
     сообщения -> чанк-сплит каждого сообщения по отдельности."""
     report = Report.from_analysis(BIG_ANALYSIS)
     msgs = render_report_messages(report, LINK, budgets=deps.prompts.get("budgets"))
-    msgs[0] = f"**Разбор: {LINK}**\n\n{msgs[0]}"
+    msgs[0] = f"**Разбор: <{LINK}>**\n\n{msgs[0]}"
     return [
         render.truncate_message(render.format_for_discord(msg), deps.config.split_threshold)[
             : deps.config.max_split_messages

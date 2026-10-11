@@ -264,6 +264,24 @@ def _queue_stale_author_refresh(deps: "Deps", report: Report) -> None:
     queue.put_nowait({"platform": platform, "handle": handle})
 
 
+TITLE_CLIP = 20  # длина названия в заголовке разбора; полное название — в имени треда
+
+
+def _disclaimer_header(job: dict) -> str:
+    """Заголовок первого сообщения треда: «Разбор: Название (Автор)».
+
+    Ссылки в заголовке нет нарочно: голый URL в сообщении даёт превью-встройку
+    в Discord. Нет describe-метаданных (сбой сети, статья) — маскированная
+    ссылка <url>: она кликабельна, но встраивание не создаёт.
+    """
+    title = job.get("display_title") or ""
+    if not title:
+        return f"Разбор: <{job['url']}>"
+    clipped = title[:TITLE_CLIP] + ("…" if len(title) > TITLE_CLIP else "")
+    author = job.get("display_author") or ""
+    return f"Разбор: {clipped} ({author})" if author else f"Разбор: {clipped}"
+
+
 async def _deliver(deps: "Deps", thread, messages: list[str], label: str) -> bool:
     """Отправляет сообщения треду; при сбое буферизует ПОЛНЫЙ хвост отчёта.
 
@@ -405,10 +423,15 @@ async def process_job(deps: Deps, job: dict) -> None:
                 # повторно разберутся на следующей попытке
                 deps.reports.put(canonical, prompts_ver, REPORT_SCHEMA, report.to_json(), content_hash)
 
-        messages = render_report_messages(report, link, budgets=budgets)
+        messages = render_report_messages(
+            report, link, budgets=budgets, section_budget=deps.config.split_threshold
+        )
         if messages:
-            # заголовок разбора — только в первом сообщении (рендер про ссылку-источник не знает)
-            messages[0] = f"**Разбор: {link}**\n\n{messages[0]}"
+            # заголовок разбора — только в первом сообщении; без ссылок, чтобы
+            # Discord не рисовал превью: «Название (Автор)» (название обрезано
+            # до TITLE_CLIP, полное — в имени треда), без метаданных —
+            # маскированная ссылка <url>: кликабельна, встраивания не создаёт
+            messages[0] = f"**{_disclaimer_header(job)}**\n\n{messages[0]}"
     except Exception as e:
         log.warning("разбор не вышел (%s): %s", canonical, e)
         prompts = deps.prompts
@@ -422,7 +445,7 @@ async def process_job(deps: Deps, job: dict) -> None:
         reason = re.sub(r"@everyone|@here|<@", "", str(e))
         error_text = prompts.get("error", _ERROR_TEMPLATE).format(reason=reason)
         delivered = await _deliver(
-            deps, thread, [f"**Разбор: {link}**\n\n{error_text}"], canonical
+            deps, thread, [f"**{_disclaimer_header(job)}**\n\n{error_text}"], canonical
         )
         # джоба упала: статус закрываем ТОЛЬКО если error-сообщение доставлено —
         # при буферизации оно остаётся (симметрично success-ветке: досылка хвоста
