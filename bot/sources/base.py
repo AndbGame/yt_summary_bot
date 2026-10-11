@@ -19,6 +19,16 @@ from bot.analysis.author import AuthorRef
 SourceKind = Literal["video", "article", "site"]
 
 
+class NotAnArticle(Exception):
+    """По ссылке нет статьи с текстом — вежливый отказ, а не сетевой сбой.
+
+    Отдельный класс (фаза 5), чтобы пайплайн отличал «здесь нет статьи»
+    (мало текста, не-html контент) от «сайт недоступен» (RuntimeError и
+    прочие исключения extract): первое — человеческий ответ пользователю,
+    второе — error-путь с пометкой джобы failed.
+    """
+
+
 @dataclass
 class SourceDocument:
     """Нормализованный результат экстракции (ARCHITECTURE.md §5).

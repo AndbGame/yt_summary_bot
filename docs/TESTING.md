@@ -55,6 +55,8 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/unit/test_jobs_store.py` | jobs-таблица: put/take_new FIFO/mark_done/mark_failed, unicode payload | `bot/store/jobs.py` |
 | `tests/unit/test_dedup_store.py` | дедуп по message_id: True/False, персистентность | `bot/store/dedup.py` |
 | `tests/e2e/test_recovery.py` | восстановление джоб после рестарта: attach статуса, state=done/failed, полный цикл | `bot/discord_app.py`, `bot/jobs.py` |
+| `tests/unit/test_article_extractor.py` | статьи: canonical-нормализация (tracking/схема/userinfo), хвостовая пунктуация URL, readability-извлечение, порог 500, SSRF-гвард, лимит 10 МБ | `bot/sources/article.py` |
+| `tests/e2e/test_article_flow.py` | полный путь статьи (без таймкодов), utm-дубликат → кеш-хит, junk → вежливый отказ (или кеш-хит), сайт 500 → error | `bot/pipeline.py`, `bot/sources/article.py` |
 
 ## E2E in-process: как устроено
 

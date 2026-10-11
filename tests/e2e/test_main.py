@@ -44,8 +44,10 @@ def test_build_deps_wires_real_components(tmp_path):
     assert isinstance(deps.client, discord.Client)
     assert isinstance(deps.queue, asyncio.Queue)
 
-    # фаза 4: роутер с YouTube-экстрактором за портом, задачи и дедуп — репозитории БД
+    # фаза 4: роутер с экстракторами за портом, задачи и дедуп — репозитории БД
+    # фаза 5: реестр [YoutubeExtractor, ArticleExtractor] — article последним
     from bot.router import Router
+    from bot.sources.article import ArticleExtractor
     from bot.sources.youtube import YoutubeExtractor
     from bot.store.dedup import DedupStore
     from bot.store.jobs import JobStore
@@ -53,6 +55,14 @@ def test_build_deps_wires_real_components(tmp_path):
     assert isinstance(deps.router, Router)
     assert isinstance(deps.router.by_name("video"), YoutubeExtractor), (
         "YouTube — первый экстрактор в реестре роутера"
+    )
+    assert isinstance(deps.router.by_name("article"), ArticleExtractor), (
+        "ArticleExtractor — экстрактор статей в реестре роутера"
+    )
+    assert len(deps.router.extractors) == 2
+    assert deps.router.extractors[0] is deps.router.by_name("video")
+    assert deps.router.extractors[-1] is deps.router.by_name("article"), (
+        "article — ПОСЛЕДНИЙ (fallback) экстрактор: YouTube забирает своё первым"
     )
     assert isinstance(deps.jobs, JobStore)
     assert isinstance(deps.dedup, DedupStore)

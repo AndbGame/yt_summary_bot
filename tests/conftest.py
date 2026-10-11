@@ -332,6 +332,36 @@ class FakeExtractor:
         )
 
 
+class FakeArticleFetch:
+    """Фейк fetch(url, timeout) экстрактора статей (фаза 5): настраиваемый ответ.
+
+    Контракт фазы 5: fetch возвращает (status, headers, text) | None — тройку
+    (у провайдера автора была пара, у статьи нужен content-type). По умолчанию
+    любой URL получает один и тот же ответ — для e2e с повторной ссылкой это
+    ровно то, что нужно (та же страница с utm-хвостом); исключение из fetch
+    эмулируется exc=..., «сеть легла» — returns_none=True. Вызовы считаются:
+    calls хранит (url, timeout) каждого запроса.
+    """
+
+    def __init__(self, html="", *, status=200, headers=None, returns_none=False, exc=None):
+        self.html = html
+        self.status = status
+        self.headers = (
+            headers if headers is not None else {"content-type": "text/html; charset=utf-8"}
+        )
+        self.returns_none = returns_none
+        self.exc = exc
+        self.calls = []
+
+    def __call__(self, url, timeout=None):
+        self.calls.append((url, timeout))
+        if self.exc is not None:
+            raise self.exc
+        if self.returns_none:
+            return None
+        return self.status, self.headers, self.html
+
+
 class InMemoryJobStore:
     """Фейк deps.jobs (фаза 4): тот же интерфейс, что JobStore на БД, данные в памяти.
 
@@ -446,6 +476,14 @@ def make_author_facts():
     """Фабрика провайдера фактов автора:
     make_author_facts(get_author_ref_result=ref, get_channel_result=facts)."""
     return FakeAuthorFactsProvider
+
+
+@pytest.fixture
+def make_article_fetch():
+    """Фабрика фейка fetch экстрактора статей (фаза 5): make_article_fetch(html),
+    make_article_fetch(status=404), make_article_fetch(returns_none=True),
+    make_article_fetch(exc=...); headers по умолчанию — text/html."""
+    return FakeArticleFetch
 
 
 @pytest.fixture

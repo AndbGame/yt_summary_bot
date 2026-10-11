@@ -113,7 +113,7 @@ async def handle(message: discord.Message, deps) -> None:
 
     status = None
     try:
-        status = await message.reply("🎬 Смотрю субтитры, готовлю тезисы...")
+        status = await message.reply("🎬 Разбираю ссылку, готовлю тезисы...")
     except discord.HTTPException:
         pass
 

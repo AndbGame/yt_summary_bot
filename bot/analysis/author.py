@@ -123,7 +123,15 @@ class YouTubeAuthorFactsProvider:
         единственный запрос это oEmbed по url; oEmbed-ответ без author_url,
         как и любой сбой сети/парса, даёт None (метод не бросает). Факты —
         отдельный шаг через get_channel(ref).
+
+        Фаза 5: не-YouTube ссылка (статья и т.п.) даёт None СРАЗУ, без oEmbed —
+        у статьи нет канала YouTube, её автор живёт в doc.data["author"] и в
+        обзорах авторов не участвует.
         """
+        from bot.sources.youtube import YT_RE  # лениво: цикл импортов author->youtube->base
+
+        if not YT_RE.search(url or ""):
+            return None
         try:
             return self._get_author_ref(url)
         except Exception:

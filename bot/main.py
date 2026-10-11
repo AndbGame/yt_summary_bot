@@ -19,6 +19,7 @@ from bot.delivery.sender import SafeSender
 from bot.jobs import create_background_queue, create_queue
 from bot.pipeline import Deps
 from bot.router import Router
+from bot.sources.article import ArticleExtractor
 from bot.sources.youtube import YoutubeExtractor
 from bot.store.db import Store
 
@@ -71,9 +72,10 @@ def build_deps(config: BotConfig) -> Deps:
         authors=store.authors,
         background_queue=create_background_queue(),
         llm_lock=asyncio.Lock(),
-        # фаза 4: реестр экстракторов (YouTube — первый, порядок = приоритет),
-        # джобы и дедуп сообщений — репозитории БД (переживают рестарт)
-        router=Router([YoutubeExtractor()]),
+        # фаза 4-5: реестр экстракторов (YouTube — первый, article — fallback,
+        # порядок = приоритет), джобы и дедуп сообщений — репозитории БД
+        # (переживают рестарт)
+        router=Router([YoutubeExtractor(), ArticleExtractor()]),
         jobs=store.jobs,
         dedup=store.dedup,
     )

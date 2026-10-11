@@ -107,3 +107,41 @@ class TestByName:
 
         assert router.by_name("video") is video
         assert router.by_name("article") is article
+
+
+class TestRealRegistryPhase5:
+    """Фаза 5: боевой реестр [YoutubeExtractor, ArticleExtractor].
+
+    ArticleExtractor — fallback: find находит ЛЮБОЙ http(s)-URL (включая
+    YouTube), но приоритет реестра отдаёт YT-ссылку YoutubeExtractor'у.
+    Импорт ArticleExtractor ленивый: до реализации фазы 5 падает этот класс,
+    а не коллекция файла.
+    """
+
+    def _registry(self):
+        from bot.sources.article import ArticleExtractor
+        from bot.sources.youtube import YoutubeExtractor
+
+        return _router([YoutubeExtractor(), ArticleExtractor()])
+
+    def test_youtube_link_routed_to_youtube_extractor(self):
+        route = self._registry().route("глянь https://youtu.be/abcdefghijk")
+
+        assert route is not None
+        assert route.extractor.name == "video", "YouTube-ссылку забирает YoutubeExtractor"
+
+    def test_article_link_reaches_article_extractor(self):
+        route = self._registry().route("почитай https://example.com/news/post")
+
+        assert route is not None
+        assert route.extractor.name == "article"
+
+    def test_article_extractor_is_fallback_for_youtube_url_too(self):
+        # сам article-экстрактор YT-ссылку находит и даёт canonical —
+        # приоритет решает только порядок в реестре
+        from bot.sources.article import ArticleExtractor
+
+        article = ArticleExtractor()
+        url = "https://youtu.be/abcdefghijk"
+        assert article.find(url) is not None
+        assert article.canonical_id(url) is not None

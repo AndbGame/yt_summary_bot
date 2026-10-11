@@ -27,6 +27,12 @@ AuthorRef по url (get_author_ref), затем кеш авторов читае
 payload как есть, а устаревшая или отсутствующая строка автора даёт фоновую
 задачу обновления — пользователь никогда не ждёт фона. Любой сбой автор-пути
 не роняет джобу.
+
+«По ссылке нет статьи» (NotAnArticle, фаза 5) — не сетевой сбой: страница
+отдаётся, но статьи в ней нет и после ретрая не появится. Разбор мог уже лежать
+в кеше (контент исчез/стал не-статьёй позже) — тогда отдаётся прошлый разбор;
+при пустом кеше статус редактируется вежливым отказом. В обоих случаях джоба
+завершается штатно (mark_done воркером), error-сообщение в тред не уходит.
 """
 
 import asyncio
@@ -46,6 +52,7 @@ from bot.config import BotConfig
 from bot.delivery.outbox import OutboxPort
 from bot.delivery.render import format_for_discord, truncate_message
 from bot.delivery.sender import SafeSender, resolve_channel
+from bot.sources.base import NotAnArticle
 
 log = logging.getLogger("yt-summary")
 
@@ -54,6 +61,12 @@ log = logging.getLogger("yt-summary")
 REPORT_SCHEMA = "blocks-1"
 
 _ERROR_TEMPLATE = "Не смог сделать разбор этого видео: {reason}"
+
+# Вежливый отказ при NotAnArticle — дублируется дефолтом на случай вырожденного
+# prompts.yaml; боевой текст живёт в prompts.yaml (ключ not_an_article)
+_NOT_AN_ARTICLE_DEFAULT = (
+    "🤔 По ссылке не нашлось статьи с текстом. Если это видео — дай ссылку на YouTube."
+)
 
 
 @dataclass
@@ -332,6 +345,29 @@ async def process_job(deps: Deps, job: dict) -> None:
         doc = None
         try:
             doc = await asyncio.to_thread(extractor.extract, url)
+        except NotAnArticle as no_article:
+            # «по ссылке нет статьи» — не сетевой сбой (ветка ДО общего except):
+            # страница отдаётся, но статьи в ней нет и после ретрая не появится.
+            # Разбор мог уже лежать в кеше (контент исчез или стал не-статьёй
+            # позже) — отдаём прошлый разбор, как и в ветке сетевого сбоя:
+            # свежесть здесь недостижима, а без фолбэка пользователь не получил
+            # бы ничего. Кеш пуст — вежливый отказ, error-сообщение в тред не
+            # уходит, исключение не пробрасывается — воркер завершит джобу
+            # штатно (mark_done)
+            cached = deps.reports.get_latest(canonical, prompts_ver, REPORT_SCHEMA)
+            if cached is None:
+                log.info("по ссылке нет статьи (%s): %s", canonical, no_article)
+                rejection = str(prompts.get("not_an_article") or _NOT_AN_ARTICLE_DEFAULT)
+                if status:
+                    try:
+                        await status.edit(content=rejection)
+                    except discord.HTTPException:
+                        pass
+                return
+            log.info(
+                "текст по ссылке исчез/стал не-статьей, отдаю прошлый разбор: %s", no_article
+            )
+            report = Report.from_json(cached)
         except Exception as extract_err:
             # Трейд-офф «свежесть vs доступность» — осознанно отдаём возможное
             # устаревшее: контент мог исчезнуть у источника навсегда, и тогда без

@@ -1,4 +1,4 @@
-"""Структура prompts.yaml фазы 2-3 — версия входит в ключ кеша отчётов.
+"""Структура prompts.yaml фаз 2-5 — версия входит в ключ кеша отчётов.
 
 Контракт (ARCHITECTURE.md §6, §8): version поднимается при смене промптов и
 детерминированно инвалидирует старые отчёты; content_analysis несёт system/user
@@ -16,8 +16,19 @@ from bot.analysis.prompts import load_prompts
 def test_prompts_yaml_declares_version():
     prompts = load_prompts()
     assert "version" in prompts, "prompts.yaml должен объявлять version — она входит в ключ кеша"
-    # фаза 2: JSON-схема ответа LLM -> версия поднята до 2
-    assert str(prompts["version"]) == "2"
+    # фаза 2: JSON-схема ответа LLM -> версия 2; фаза 5: статьи — тот же вызов,
+    # но промпт говорит про «материал (субтитры видео или текст статьи)» -> 3
+    assert str(prompts["version"]) == "3"
+
+
+def test_content_analysis_user_mentions_articles():
+    # фаза 5: контент-вызов разбирает и видео, и статьи — user-промпт говорит
+    # про материал (субтитры видео или текст статьи) и про null start_sec статей
+    user = str(load_prompts().get("content_analysis", {}).get("user", ""))
+    assert re.search(r"стат\w+", user, re.IGNORECASE), (
+        "в user-промпте упомянуты статьи (статья/статьи/статью/статей)"
+    )
+    assert "null" in user, "правило start_sec: для статей — null (упомянуто в промпте)"
 
 
 def test_content_analysis_section_present():

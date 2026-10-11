@@ -180,6 +180,31 @@ class TestProviderGetAuthorRef:
         assert _provider(FakeFetch(raise_on_call=True)).get_author_ref(self.VIDEO_URL) is None
 
 
+class TestProviderNonYoutubeUrl:
+    """Фаза 5: провайдер YouTube обслуживает только YouTube-ссылки.
+
+    Для не-YT url (статья) get_author_ref возвращает None СРАЗУ — без oEmbed,
+    без сети: у статьи нет канала, автор живёт в doc.data["author"], а не в
+    обзорах авторов.
+    """
+
+    NON_YT_URLS = (
+        "https://example.com/news/some-article",
+        "https://vimeo.com/12345",
+        "не ссылка вообще",
+    )
+
+    def test_get_author_ref_none_without_any_network_call(self):
+        # raise_on_call + счётчик: любая попытка дойти до oEmbed видна в fetch.urls
+        fetch = FakeFetch(raise_on_call=True)
+        provider = _provider(fetch)
+
+        for url in self.NON_YT_URLS:
+            assert provider.get_author_ref(url) is None, url
+
+        assert fetch.urls == [], "для не-YouTube url fetch не вызывается вовсе"
+
+
 class TestProviderGetChannel:
     def test_uc_handle_uses_channel_url(self):
         fetch = FakeFetch(page=(200, CHANNEL_PAGE))
