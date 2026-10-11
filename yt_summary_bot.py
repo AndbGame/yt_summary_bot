@@ -177,7 +177,7 @@ def summarize(transcript: str) -> str:
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=messages,
-                max_tokens=2000,
+                max_tokens=50000,
                 temperature=0.3,
             )
             content = (resp.choices[0].message.content or "").strip()
