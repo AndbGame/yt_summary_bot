@@ -9,6 +9,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 
+from bot.store.authors import AuthorStore
 from bot.store.outbox import DbOutbox
 from bot.store.reports import ReportStore
 
@@ -54,6 +55,21 @@ _MIGRATIONS = {
         );
     """,
     2: _add_reports_content_hash,
+    # шаг 3 (фаза 3): факты + LLM-обзор автора с TTL, ключ (platform, handle);
+    # analyzed_at/refreshed_at штампует AuthorStore.put при записи
+    3: """
+        CREATE TABLE IF NOT EXISTS authors (
+            platform     TEXT NOT NULL,
+            handle       TEXT NOT NULL,
+            display_name TEXT,
+            facts_json   TEXT,
+            review_json  TEXT,
+            prompts_ver  TEXT,
+            analyzed_at  INTEGER,
+            refreshed_at INTEGER,
+            PRIMARY KEY (platform, handle)
+        );
+    """,
 }
 
 
@@ -73,6 +89,7 @@ class Store:
         self._migrate()
         self._reports = ReportStore(self)
         self._outbox = DbOutbox(self)
+        self._authors = AuthorStore(self)
 
     def _migrate(self) -> None:
         """Применяет недостающие шаги миграции.
@@ -129,6 +146,11 @@ class Store:
     def outbox(self) -> DbOutbox:
         """Репозиторий outbox — буфер недоставленных сообщений в БД."""
         return self._outbox
+
+    @property
+    def authors(self) -> AuthorStore:
+        """Репозиторий кеша обзоров авторов — единый на Store."""
+        return self._authors
 
     def close(self) -> None:
         """Закрывает соединение; данные уже закоммичены каждой транзакцией."""

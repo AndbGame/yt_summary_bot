@@ -331,3 +331,87 @@ class TestAnalyzeApiContract:
 
         _client(config).analyze_content("транскрипт")
         assert comp.last_kwargs["max_tokens"] == 50000
+
+
+# Промпты фазы 3: секция author_review с подстановками фактов
+_AUTHOR_PROMPTS = {
+    "author_review": {
+        "system": "СИСТЕМА АВТОРА",
+        "user": "Факты: {name} ({url}); описание: {description}{extra_block}",
+    }
+}
+
+
+def _author_client(prompts=None, **overrides):
+    return llm_mod.LLMClient(_config(**overrides), _AUTHOR_PROMPTS if prompts is None else prompts)
+
+
+def _facts(**overrides):
+    params = {"name": "Имя", "url": "https://youtube.com/@n", "description": "описание", "extra": {}}
+    params.update(overrides)
+    return SimpleNamespace(**params)
+
+
+class TestReviewAuthor:
+    """review_author (фаза 3): текст без JSON-режима, кэп max_tokens, подстановки."""
+
+    def test_text_response_without_response_format(self, monkeypatch):
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        assert _author_client().review_author(_facts()) == "Обзор автора"
+        assert "response_format" not in comp.last_kwargs
+
+    def test_author_prompts_and_extra_block_used(self, monkeypatch):
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client().review_author(_facts(name="Иван", extra={"подписчики": 1000}))
+        messages = comp.last_kwargs["messages"]
+        assert messages[0] == {"role": "system", "content": "СИСТЕМА АВТОРА"}
+        assert messages[1]["content"] == (
+            "Факты: Иван (https://youtube.com/@n); описание: описание\nдополнительно: подписчики: 1000"
+        )
+
+    def test_empty_extra_omits_dopolnitelno_line(self, monkeypatch):
+        # пустой extra — строки «дополнительно» в промпте нет вовсе: иначе LLM
+        # получает висячее «дополнительно: нет» и пытается «дополнить» обзор
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client().review_author(_facts(extra={}))
+        assert "дополнительно" not in comp.last_kwargs["messages"][1]["content"]
+
+    def test_max_tokens_capped_at_1024(self, monkeypatch):
+        # провайдеры с жёстким лимитом вывода дают 400 на max_tokens выше потолка
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client(llm_max_tokens=50000).review_author(_facts())
+        assert comp.last_kwargs["max_tokens"] == 1024
+
+    def test_max_tokens_uses_config_below_cap(self, monkeypatch):
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client(llm_max_tokens=512).review_author(_facts())
+        assert comp.last_kwargs["max_tokens"] == 512
+
+    def test_substitution_single_pass_braces_in_value_kept(self, monkeypatch):
+        # один проход: значение с {url} внутри не подставляется второй раз
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client().review_author(_facts(name='Иван "{url}"'))
+        user_msg = comp.last_kwargs["messages"][1]["content"]
+        assert 'Иван "{url}"' in user_msg, "подстановки не резканируют друг друга"
+        assert user_msg.count("https://youtube.com/@n") == 1
+
+    def test_unknown_placeholder_stays_literal(self, monkeypatch):
+        prompts = {"author_review": {"user": "Автор: {name}; {unknown}"}}
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client(prompts).review_author(_facts())
+        assert comp.last_kwargs["messages"][1]["content"] == "Автор: Имя; {unknown}"
+
+    def test_missing_section_falls_back_to_defaults(self, monkeypatch):
+        comp, _ = _patch_llm(monkeypatch, [_resp("Обзор автора")])
+
+        _author_client({}).review_author(_facts(name="Иван"))
+        user_msg = comp.last_kwargs["messages"][1]["content"]
+        assert "НАЧАЛО ФАКТОВ" in user_msg
+        assert "Иван" in user_msg

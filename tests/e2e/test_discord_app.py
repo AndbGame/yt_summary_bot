@@ -2,7 +2,8 @@
 
 Полностью на фейках: клиент-«регистратор» событий вместо discord.Client,
 sender со счётчиком вызовов; asyncio.create_task подменён счётчиком корутин,
-чтобы бесконечные llm_worker/flush_loop не запускались по-настоящему.
+чтобы бесконечные llm_worker/flush_loop/author_refresh_worker не запускались
+по-настоящему.
 """
 
 import asyncio
@@ -67,8 +68,13 @@ def test_on_ready_starts_background_tasks_exactly_once(monkeypatch, make_deps):
     client = discord_app.attach_handlers(_EventClient(), deps)
     _run_on_ready_twice(client)
 
-    # llm_worker и flush_loop созданы ровно один раз, при первом on_ready
-    assert [c.cr_code.co_name for c in created] == ["llm_worker", "flush_loop"]
+    # три фоновые задачи созданы ровно один раз, при первом on_ready
+    # (фаза 3 добавила author_refresh_worker — фоновую очередь обновления обзоров)
+    assert [c.cr_code.co_name for c in created] == [
+        "llm_worker",
+        "flush_loop",
+        "author_refresh_worker",
+    ]
 
 
 def test_on_ready_flushes_pending_on_start(monkeypatch, make_deps):

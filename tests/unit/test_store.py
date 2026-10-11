@@ -142,7 +142,9 @@ class TestMigrations:
 
         store = Store(path)
         try:
-            assert _sql(path, "PRAGMA user_version")[0][0] == 2, "применён шаг миграции 2"
+            # миграции кумулятивны: после фазы 3 на чистой БД будет версия 3,
+            # поэтому проверяем нижнюю границу «шаг 2 применён», не точное равенство
+            assert _sql(path, "PRAGMA user_version")[0][0] >= 2, "применён шаг миграции 2"
             cols = [r[1] for r in _sql(path, "PRAGMA table_info(reports)")]
             assert cols[-1] == "content_hash"
             # старые строки читаются через get с None-хэшем (NULL в колонке)

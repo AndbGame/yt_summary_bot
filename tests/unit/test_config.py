@@ -25,6 +25,7 @@ def test_defaults():
     assert config.db_path == "bot_data.sqlite3"
     assert config.split_threshold == 1900
     assert config.max_split_messages == 8
+    assert config.author_ttl_days == 90  # фаза 3: TTL обзора автора
 
 
 def test_from_env_reads_dotenv(tmp_path):
@@ -92,6 +93,15 @@ def test_llm_max_tokens_garbage_falls_back_to_default(tmp_path, garbage):
     assert config.llm_max_tokens == 50000
 
 
+@pytest.mark.parametrize("garbage", ["abc", "", "12.5", "  "])
+def test_author_ttl_days_garbage_falls_back_to_default(tmp_path, garbage):
+    # мусорный AUTHOR_TTL_DAYS не должен ронять конфиг — берётся дефолт (90 дней)
+    config = BotConfig.from_env(
+        environ={"AUTHOR_TTL_DAYS": garbage}, env_file=tmp_path / ".env"
+    )
+    assert config.author_ttl_days == 90
+
+
 @pytest.mark.parametrize(
     ("env_name", "field", "value"),
     [
@@ -101,6 +111,7 @@ def test_llm_max_tokens_garbage_falls_back_to_default(tmp_path, garbage):
         ("TRANSCRIPT_LIMIT", "transcript_limit", "999"),
         ("SPLIT_THRESHOLD", "split_threshold", "1500"),
         ("MAX_SPLIT_MESSAGES", "max_split_messages", "4"),
+        ("AUTHOR_TTL_DAYS", "author_ttl_days", "30"),
     ],
 )
 def test_int_fields_env_override(tmp_path, env_name, field, value):

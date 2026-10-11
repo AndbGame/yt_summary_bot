@@ -116,7 +116,7 @@ SourceDocument  — результат экстракции (нормализо�
                   sections: [Section]     # title, start_sec (если известны)
                   fetched_at, content_hash
 AuthorRef       — (platform, handle/channel_id) — стабильный ключ автора
-AuthorProfile   — факты об авторе: имя, описание, ссылки, метрики, найдено когда
+AuthorFacts     — факты об авторе: имя, ссылка, описание канала, extra (собирает FactsProvider)
 AuthorReview    — LLM-разбор автора по фактам (+ дата, версия промпта)
 Report          — [ReportBlock], где ReportBlock = (kind, title, body_md, ver)
 ReportBlock.kind = brief | theses | detailed | author | context
@@ -171,8 +171,8 @@ sequenceDiagram
    - **контент-вызов** (один): вход — SourceDocument, выход — JSON
      `{brief, theses[], sections[{title, start_sec, body}], context}`
      (context — «простым языком» для сложных тем, опционально);
-   - **автор-вызов**: вход — AuthorProfile (факты!) + свежий контент,
-     выход — обзор. Кешируется отдельно с TTL.
+   - **автор-вызов**: вход — AuthorFacts (факты!), выход — обзор.
+     Кешируется отдельно с TTL (authors, ~90 дней).
 4. **Render** — Report → список Discord-сообщений (§9).
 5. **Deliver** — safe_send с ретраями; недоставленное — в outbox (таблица БД,
    обобщение сегодняшнего `pending_replies.json`), порядок сохраняется.
@@ -225,7 +225,7 @@ CREATE TABLE authors (
   platform     TEXT NOT NULL,
   handle       TEXT NOT NULL,
   display_name TEXT,
-  profile_json TEXT,                 -- факты (для повторных LLM-разборов)
+  facts_json   TEXT,                 -- факты (для повторных LLM-разборов)
   review_json  TEXT,                 -- текущий LLM-обзор
   prompts_ver  TEXT,
   analyzed_at  INTEGER,              -- когда делали обзор

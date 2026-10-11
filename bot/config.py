@@ -26,6 +26,7 @@ DEFAULT_TRANSCRIPT_LIMIT = 50000
 DEFAULT_DB_PATH = "bot_data.sqlite3"
 DEFAULT_SPLIT_THRESHOLD = 1900
 DEFAULT_MAX_SPLIT_MESSAGES = 8
+DEFAULT_AUTHOR_TTL_DAYS = 90  # TTL обзора автора (ARCHITECTURE.md §7)
 
 # Имя env-переменной для каждого поля; нужно main() для текста об ошибке запуска
 ENV_NAMES = {
@@ -42,6 +43,7 @@ ENV_NAMES = {
     "db_path": "DB_PATH",
     "split_threshold": "SPLIT_THRESHOLD",
     "max_split_messages": "MAX_SPLIT_MESSAGES",
+    "author_ttl_days": "AUTHOR_TTL_DAYS",
 }
 
 # .env ищется в корне репозитория (рядом с шимом yt_summary_bot.py)
@@ -98,6 +100,7 @@ class BotConfig:
     db_path: str = DEFAULT_DB_PATH  # задел под SQLite-кеш (фаза 1)
     split_threshold: int = DEFAULT_SPLIT_THRESHOLD
     max_split_messages: int = DEFAULT_MAX_SPLIT_MESSAGES
+    author_ttl_days: int = DEFAULT_AUTHOR_TTL_DAYS
 
     @classmethod
     def from_env(cls, environ=None, env_file=None) -> "BotConfig":
@@ -123,6 +126,7 @@ class BotConfig:
             max_split_messages=_env_int(
                 env, ENV_NAMES["max_split_messages"], DEFAULT_MAX_SPLIT_MESSAGES
             ),
+            author_ttl_days=_env_int(env, ENV_NAMES["author_ttl_days"], DEFAULT_AUTHOR_TTL_DAYS),
         )
 
     def missing_fields(self) -> list:

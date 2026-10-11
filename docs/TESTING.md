@@ -47,6 +47,9 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/e2e/test_legacy_migration.py` | миграция pending_replies.json → БД: атомарный merge одной транзакцией, битые/кривые файлы → .corrupted | `bot/main.py` |
 | `tests/unit/test_report.py` | Report/ReportBlock: from_analysis, JSON roundtrip, терпеливый парсер, бюджеты, прогрессивный рендер (таймкоды, context, автор последним) | `bot/analysis/report.py` |
 | `tests/e2e/test_report_flow.py` | полный путь JSON-отчёта в тред, обрезка по бюджетам, мусор от LLM → error-промпт | `bot/pipeline.py`, `bot/analysis/report.py` |
+| `tests/unit/test_author.py` | AuthorRef/AuthorFacts, провайдер: oEmbed/og:description, все сбои → None, URL-форматы UC/@ | `bot/analysis/author.py` |
+| `tests/unit/test_author_store.py` | authors-таблица: roundtrip, PK, миграция v2→v3, is_fresh TTL-границы | `bot/store/authors.py` |
+| `tests/e2e/test_author_flow.py` | автор-путь: MISS (факты→обзор→блок в кеш), HIT без сети, устаревший → фон, дедуп refresh, llm_lock не даёт пересечений analyze×review, деградация при сбое кеша автора | `bot/pipeline.py`, `bot/jobs.py` |
 
 ## E2E in-process: как устроено
 

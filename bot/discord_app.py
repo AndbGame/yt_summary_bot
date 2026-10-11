@@ -11,7 +11,7 @@ import logging
 
 import discord
 
-from bot.jobs import llm_worker
+from bot.jobs import author_refresh_worker, llm_worker
 from bot.sources.youtube import extract_video_id, thread_name_from_message
 
 log = logging.getLogger("yt-summary")
@@ -125,6 +125,11 @@ def attach_handlers(client: discord.Client, deps) -> discord.Client:
             bg_started = True
             asyncio.create_task(llm_worker(deps.queue, deps))
             asyncio.create_task(deps.sender.flush_loop())
+            # фазовое обновление обзоров авторов — тоже бесконечный воркер,
+            # стартует однократно вместе с остальным фоном
+            background_queue = getattr(deps, "background_queue", None)
+            if background_queue is not None:
+                asyncio.create_task(author_refresh_worker(background_queue, deps))
         # вернулись онлайн — сразу досылаем то, что накопилось за офлайн
         try:
             await deps.sender.flush_pending()

@@ -1,11 +1,14 @@
-"""Структура prompts.yaml фазы 2 — версия входит в ключ кеша отчётов.
+"""Структура prompts.yaml фазы 2-3 — версия входит в ключ кеша отчётов.
 
 Контракт (ARCHITECTURE.md §6, §8): version поднимается при смене промптов и
 детерминированно инвалидирует старые отчёты; content_analysis несёт system/user
-для JSON-разбора контента ({transcript} в user); budgets — бюджеты символов
-блоков для валидации и рендера. Тексты промптов пишет реализователь — тесты
-проверяют только наличие и форму.
+для JSON-разбора контента ({transcript} в user); author_review (фаза 3) —
+system/user для обзора автора по фактам (в user — подстановки фактов);
+budgets — бюджеты символов блоков для валидации и рендера. Тексты промптов
+пишет реализователь — тесты проверяют только наличие и форму.
 """
+
+import re
 
 from bot.analysis.prompts import load_prompts
 
@@ -23,6 +26,18 @@ def test_content_analysis_section_present():
     assert str(ca.get("system", "")).strip(), "content_analysis.system непустой"
     assert str(ca.get("user", "")).strip(), "content_analysis.user непустой"
     assert "{transcript}" in ca["user"], "user-промпт содержит подстановку {transcript}"
+
+
+def test_author_review_section_present():
+    # фаза 3: обзор автора строится по фактам (AuthorFacts), не по знаниям модели
+    ar = load_prompts().get("author_review")
+    assert isinstance(ar, dict), "prompts.yaml должен содержать секцию author_review"
+    assert str(ar.get("system", "")).strip(), "author_review.system непустой"
+    assert str(ar.get("user", "")).strip(), "author_review.user непустой"
+    assert re.search(r"\{\w+\}", ar["user"]), (
+        "user-промпт содержит подстановку фактов автора ({...}) — какие именно имена "
+        "подстановок выбрать, решает реализователь, дословно не фиксируем"
+    )
 
 
 def test_budgets_section_with_five_keys():

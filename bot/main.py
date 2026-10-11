@@ -4,17 +4,19 @@
 на импорте не читается .env, не создаются клиенты и нет сети.
 """
 
+import asyncio
 import json
 import logging
 import sys
 from pathlib import Path
 
 from bot import discord_app
+from bot.analysis.author import YouTubeAuthorFactsProvider
 from bot.analysis.llm import LLMClient
 from bot.analysis.prompts import load_prompts
 from bot.config import ENV_NAMES, BotConfig
 from bot.delivery.sender import SafeSender
-from bot.jobs import create_queue
+from bot.jobs import create_background_queue, create_queue
 from bot.pipeline import Deps
 from bot.store.db import Store
 
@@ -59,6 +61,13 @@ def build_deps(config: BotConfig) -> Deps:
         client=client,
         queue=queue,
         reports=store.reports,
+        # фаза 3: факты автора (oEmbed), кеш обзоров авторов, фоновая очередь
+        # обновления и общий лок LLM-вызовов (контент-разбор и обзор автора
+        # идут из разных воркеров и не должны пересекаться)
+        author_facts=YouTubeAuthorFactsProvider(),
+        authors=store.authors,
+        background_queue=create_background_queue(),
+        llm_lock=asyncio.Lock(),
     )
     discord_app.attach_handlers(client, deps)
     return deps
