@@ -1,8 +1,8 @@
 """Общий bootstrap тестов и общие фейки Discord/LLM.
 
 Репозиторий добавляется в sys.path, чтобы `import bot` работал из корня;
-фейки (треды, статусные сообщения, LLM, discord-клиент) собраны здесь и
-разданы фикстурами-фабриками, чтобы юнит- и e2e-тесты не дублировали их.
+фейки (треды, статусные сообщения, LLM, discord-клиент, кеш отчётов) собраны
+здесь и разданы фикстурами-фабриками, чтобы юнит- и e2e-тесты не дублировали их.
 """
 
 import asyncio
@@ -112,6 +112,24 @@ class FakeClient:
         return self.ready
 
 
+class InMemoryReportStore:
+    """Фейк deps.reports (кеш отчётов): тот же интерфейс get/put, что у ReportStore.
+
+    Данные только в памяти; персистентность и схема БД проверяются отдельными
+    тестами настоящего Store (tests/unit/test_store.py). Нужен, чтобы все
+    существующие e2e-тесты работали с полем deps.reports без SQLite-файла.
+    """
+
+    def __init__(self):
+        self._reports = {}
+
+    def get(self, canonical_id, prompts_ver, schema_ver):
+        return self._reports.get((canonical_id, prompts_ver, schema_ver))
+
+    def put(self, canonical_id, prompts_ver, schema_ver, payload):
+        self._reports[(canonical_id, prompts_ver, schema_ver)] = payload
+
+
 # --------------------------------------------------------- фикстуры-фабрики
 
 
@@ -154,7 +172,8 @@ def make_deps(tmp_path, make_client, make_llm):
     """Собирает Deps на фейках: все части можно подменить по одному.
 
     По умолчанию: конфиг с тестовыми токенами, фейк-клиент, фейк-LLM,
-    PendingOutbox во временном файле и реальный SafeSender поверх фейков.
+    PendingOutbox во временном файле, InMemoryReportStore как кеш отчётов
+    (deps.reports) и реальный SafeSender поверх фейков.
     """
     from bot import jobs as jobs_mod
     from bot.analysis.prompts import load_prompts
@@ -175,6 +194,7 @@ def make_deps(tmp_path, make_client, make_llm):
         prompts=None,
         sender=None,
         queue=None,
+        reports=None,
         thread=None,
     ):
         if config is None:
@@ -192,6 +212,10 @@ def make_deps(tmp_path, make_client, make_llm):
             sender = SafeSender(client, outbox, config)
         if queue is None:
             queue = jobs_mod.create_queue()
+        if reports is None:
+            # кеш отчётов по умолчанию — in-memory фейк: e2e-тесты кеша
+            # подменяют его на настоящий Store (tests/e2e/test_pipeline_cache.py)
+            reports = InMemoryReportStore()
         return Deps(
             config=config,
             llm=llm,
@@ -200,6 +224,7 @@ def make_deps(tmp_path, make_client, make_llm):
             sender=sender,
             client=client,
             queue=queue,
+            reports=reports,
         )
 
     return _make

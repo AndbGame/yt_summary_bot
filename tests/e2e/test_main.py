@@ -9,9 +9,10 @@ import discord
 import pytest
 
 from bot.config import BotConfig
-from bot.delivery.outbox import PendingOutbox
 from bot.delivery.sender import SafeSender
 from bot.main import build_deps, main
+from bot.store.outbox import DbOutbox
+from bot.store.reports import ReportStore
 
 
 class _StubConfigEmpty:
@@ -37,7 +38,8 @@ def test_build_deps_wires_real_components(tmp_path):
 
     assert deps.config is config
     assert hasattr(deps.llm, "summarize")  # реальный LLMClient за портом .summarize
-    assert isinstance(deps.outbox, PendingOutbox)
+    assert isinstance(deps.outbox, DbOutbox)
+    assert isinstance(deps.reports, ReportStore)
     assert isinstance(deps.sender, SafeSender)
     assert isinstance(deps.client, discord.Client)
     assert isinstance(deps.queue, asyncio.Queue)

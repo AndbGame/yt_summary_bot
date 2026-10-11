@@ -22,6 +22,15 @@ def extract_video_id(text: str):
     return m.group(1), m.start(), m.end()
 
 
+def canonical_video_id(video_id: str) -> str:
+    """Канонический идентификатор источника — первая часть ключа кеша отчётов.
+
+    Формат youtube:video:<id> (ARCHITECTURE.md §7): позже рядом появятся
+    article:<norm-url> и site:<domain>, ключи не пересекутся.
+    """
+    return f"youtube:video:{video_id}"
+
+
 def thread_name_from_message(text: str, video_id: str) -> str:
     """Имя треда: текст сообщения без ссылки, либо 'Видео <id>' (монолитный build_thread_name)."""
     text = YT_RE.sub("", text).strip() or f"Видео {video_id}"

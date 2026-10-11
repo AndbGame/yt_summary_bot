@@ -1,7 +1,8 @@
 """Надёжная отправка в Discord: ретраи на сетевых сбоях + досылка буфера.
 
 Стратегия из монолита: короткий ретрай-цикл send(), затем персистентный буфер
-(PendingOutbox) и фоновая досылка flush_loop(), пока бот снова не встанет онлайн.
+(порт OutboxPort — в проде DbOutbox) и фоновая досылка flush_loop(), пока бот
+снова не встанет онлайн.
 """
 
 import asyncio
@@ -12,7 +13,7 @@ import aiohttp
 import discord
 
 from bot.config import BotConfig
-from bot.delivery.outbox import PendingOutbox
+from bot.delivery.outbox import OutboxPort
 
 log = logging.getLogger("yt-summary")
 
@@ -44,7 +45,7 @@ async def resolve_channel(client: Any, thread_id: int):
 class SafeSender:
     """Отправка с ретраями и досылка персистентного буфера; клиент — из Deps."""
 
-    def __init__(self, client: Any, outbox: PendingOutbox, config: BotConfig):
+    def __init__(self, client: Any, outbox: OutboxPort, config: BotConfig):
         self.client = client
         self.outbox = outbox
         self.config = config

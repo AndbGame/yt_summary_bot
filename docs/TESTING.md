@@ -40,6 +40,11 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/e2e/test_handle.py` | роутинг ссылки, дедуп, 160004, Forbidden, позиция в очереди | `bot/discord_app.py` |
 | `tests/e2e/test_discord_app.py` | on_ready: однократный старт воркеров, flush при старте | `bot/discord_app.py` |
 | `tests/e2e/test_main.py` | build_deps (реальная композиция), main(): валидация/env-имена, запуск | `bot/main.py` |
+| `tests/unit/test_store.py` | SQLite: схема reports/outbox, WAL, идемпотентные миграции, FIFO, параллельные записи, close/reopen | `bot/store/` |
+| `tests/unit/test_store_outbox_compat.py` | общий набор outbox-поведений на PendingOutbox (JSON) и DbOutbox (SQLite) — LSP-совместимость | `bot/delivery/outbox.py`, `bot/store/outbox.py` |
+| `tests/unit/test_canonical.py` | формат canonical_id | `bot/sources/youtube.py` |
+| `tests/e2e/test_pipeline_cache.py` | кеш: промах/хит/перезапуск/смена версии промптов, ошибки не кешируются | `bot/pipeline.py`, `bot/store/reports.py` |
+| `tests/e2e/test_legacy_migration.py` | миграция pending_replies.json → БД: атомарный merge одной транзакцией, битые/кривые файлы → .corrupted | `bot/main.py` |
 
 ## E2E in-process: как устроено
 

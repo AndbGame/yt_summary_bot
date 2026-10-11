@@ -2,14 +2,31 @@
 
 Гарантии из монолита: порядок сообщений сохраняется, запись атомарная
 (.tmp -> replace) — переживает падение процесса в середине записи.
-Обобщение в outbox-таблицу БД запланировано фазой 4 (ARCHITECTURE.md §10).
+Обобщение в outbox-таблицу БД сделано фазой 1 (DbOutbox в bot/store/outbox.py);
+PendingOutbox остаётся эталоном формата для compat-тестов (общий интерфейс
+гоняется на обеих реализациях) и для миграции легаси-файла (bot/main.py).
 """
 
 import json
 import logging
 from pathlib import Path
+from typing import Protocol
 
 log = logging.getLogger("yt-summary")
+
+
+class OutboxPort(Protocol):
+    """Порт буфера недоставленных сообщений: общий интерфейс load/save/append.
+
+    Структурно ему соответствуют DbOutbox и PendingOutbox; SafeSender и
+    pipeline.Deps аннотируются портом, а не конкретной реализацией.
+    """
+
+    def load(self) -> list: ...
+
+    def save(self, items: list) -> None: ...
+
+    def append(self, thread_id: int, content: str) -> None: ...
 
 
 class PendingOutbox:
