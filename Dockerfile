@@ -10,10 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
     && ln -sf /usr/lib/ssl/cert.pem /usr/local/lib/python3.12/site-packages/certifi/cacert.pem
 
 COPY entrypoint.sh /app/entrypoint.sh
-# exec-бит задаем при каждом старте (см. ENTRYPOINT): монтируемая папка Windows
+# exec-бит задаем при каждом старте: монтируемая папка Windows
 # может сбросить права после git reset --hard
 ENTRYPOINT ["/bin/sh", "-c", "chmod +x /app/entrypoint.sh && exec /app/entrypoint.sh"]
 
 ENV PYTHONUNBUFFERED=1
-
-ENTRYPOINT ["/app/entrypoint.sh"]
