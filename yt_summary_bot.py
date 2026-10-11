@@ -2,6 +2,12 @@
 """Discord bot: создаёт тред под каждым сообщением с YouTube-ссылкой
 и постит туда тезисное саммари видео (по субтитрам + LLM).
 
+Надёжность:
+  - все задачи идут через одну очередь: не более одного LLM-запроса одновременно;
+  - лимиты LLM (429) и сетевые сбои API ретраятся с экспоненциальной задержкой;
+  - если Discord недоступен, ответы накапливаются в pending_replies.json
+    и досылаются автоматически, когда бот вернётся онлайн.
+
 Настройка через переменные окружения или .env рядом со скриптом:
   DISCORD_BOT_TOKEN  — токен бота (обязательно)
   LLM_API_KEY        — ключ OpenAI-совместимого API (обязательно)
@@ -12,17 +18,21 @@
 """
 
 import asyncio
+import json
 import logging
 import os
+import random
 import re
 import sys
+import time
 from pathlib import Path
 
+import aiohttp
 import discord
 import requests
 import yaml
 import youtube_transcript_api
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIConnectionError, APITimeoutError
 
 # ---------------------------------------------------------------- config ---
 
@@ -47,7 +57,13 @@ LLM_MODEL   = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 MAX_MESSAGE_LENGTH = 2000
 SPLIT_THRESHOLD    = 1900
 MAX_SPLIT_MESSAGES = 8
-EMBED_DESC_LIMIT   = 4096
+
+# Надёжность
+LLM_MAX_ATTEMPTS  = int(os.environ.get("LLM_MAX_ATTEMPTS", "5"))   # попыток на один summarize
+LLM_MAX_BACKOFF   = int(os.environ.get("LLM_MAX_BACKOFF", "120"))  # макс пауза между попытками, сек
+SEND_MAX_ATTEMPTS = 3          # попыток отправить чанк в Discord до буферизации
+FLUSH_INTERVAL_S  = 60         # период фоновой досылки буфера
+TRANSCRIPT_LIMIT  = 50000      # обрезка субтитров для LLM
 
 # Промпты — в prompts.yaml рядом со скриптом
 def load_prompts():
@@ -57,6 +73,9 @@ def load_prompts():
     return {}
 
 PROMPTS = load_prompts()
+
+# Персистентный буфер недоставленных сообщений
+PENDING_FILE = Path(__file__).parent / "pending_replies.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +90,7 @@ YT_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?.*?v=|shorts/|live/|embed/)|youtu\.be/)"
     r"([\w-]{11})"
 )
+
 
 def extract_video_id(text: str):
     """Возвращает (video_id, start, end) или None. start/end — границы совпадения."""
@@ -118,20 +138,68 @@ def fetch_transcript(video_id: str) -> str:
         lines.append(f"[{stamp}] {s.text}")
     return "\n".join(lines)
 
+# ------------------------------------------------------------------- llm ---
+
+def _retry_after_seconds(exc, cap: float = LLM_MAX_BACKOFF):
+    """Достаёт Retry-After из ответа API (секунды), если провайдер его прислал."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    for key in ("retry-after", "Retry-After", "x-ratelimit-reset-requests"):
+        raw = headers.get(key)
+        if raw:
+            try:
+                return min(cap, max(1.0, float(raw)))
+            except (TypeError, ValueError):
+                continue
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        try:
+            return min(cap, max(1.0, float(body.get("error", {}).get("retry_after"))))
+        except (TypeError, ValueError):
+            pass
+    return None
+
 
 def summarize(transcript: str) -> str:
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": PROMPTS.get("system", "Ты кратко и по делу пересказываешь видео по субтитрам.")},
-            {"role": "user", "content": PROMPTS.get("user", "").format(transcript=transcript[:50000])},
-        ],
-        max_tokens=700,
-        temperature=0.3,
-    )
-    return resp.choices[0].message.content.strip()
+    """Саммари через LLM. Ретраи на 429/лимиты и сетевые сбои, пауза экспоненциальная.
 
+    Бросает исключение только после LLM_MAX_ATTEMPTS неудач — вызывающий код
+    тогда отправляет в тред текст ошибки из prompts.yaml.
+    """
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    messages = [
+        {"role": "system", "content": PROMPTS.get("system", "Ты кратко и по делу пересказываешь видео по субтитрам.")},
+        {"role": "user", "content": PROMPTS.get("user", "").format(transcript=transcript[:TRANSCRIPT_LIMIT])},
+    ]
+    last_exc = None
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                max_tokens=700,
+                temperature=0.3,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            if content:
+                return content
+            raise RuntimeError("LLM вернул пустой ответ")
+        except RateLimitError as e:
+            wait = _retry_after_seconds(e) or min(LLM_MAX_BACKOFF, 5 * 2 ** (attempt - 1))
+            log.warning("LLM: лимит запросов (попытка %d/%d), пауза %.0fс", attempt, LLM_MAX_ATTEMPTS, wait)
+            last_exc = e
+        except (APIConnectionError, APITimeoutError) as e:
+            wait = min(LLM_MAX_BACKOFF, 3 * 2 ** (attempt - 1))
+            log.warning("LLM: сетевой сбой (попытка %d/%d), пауза %.0fс: %s", attempt, LLM_MAX_ATTEMPTS, wait, e)
+            last_exc = e
+        except RuntimeError as e:
+            # пустой ответ — короткая пауза и повтор
+            wait = 2 * attempt
+            log.warning("LLM: %s (попытка %d/%d)", e, attempt, LLM_MAX_ATTEMPTS)
+            last_exc = e
+        # джиттер, чтобы при пачке запросов не биться синхронно
+        time.sleep(wait + random.uniform(0, 1))
+    raise last_exc or RuntimeError("LLM: исчерпаны попытки")
 
 # --------------------------------------------- discord-форматирование (из Hermes) ---
 # Портировано из gateway/platforms/helpers.py и base.py агента Hermes:
@@ -144,12 +212,12 @@ _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}.*\|.*$")
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 
 
-def _split_table_row(line: str) -> list[str]:
+def _split_table_row(line: str) -> list:
     line = line.strip().strip("|")
     return [c.strip() for c in line.split("|")]
 
 
-def _render_table_block(table_block: list[str]) -> str:
+def _render_table_block(table_block: list) -> str:
     headers = _split_table_row(table_block[0]) if len(table_block) >= 3 else []
     if len(headers) < 2:
         return "\n".join(table_block)
@@ -204,7 +272,7 @@ def _fence_state_after(text: str, in_code: bool, lang: str):
     return in_code, lang
 
 
-def truncate_message(content: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
+def truncate_message(content: str, max_length: int = MAX_MESSAGE_LENGTH) -> list:
     """Сплит с сохранением code-fence: разрез внутри блока закрывает фенс в конце
     чанка и переоткрывает его (с тем же языком) в следующем; (1/N) индикаторы."""
     if len(content) <= max_length:
@@ -246,14 +314,164 @@ intents.guilds = True
 
 client = discord.Client(intents=intents)
 # защита от повторной обработки (редакты/репосты той же ссылки)
-processed: set[str] = set()
+processed: set = set()
+
+# Очередь задач: один worker -> не более одного LLM-запроса в момент времени
+job_queue: asyncio.Queue = asyncio.Queue()
+
+# ------------------------------------------------------ персистентный буфер --
+
+def _pending_load() -> list:
+    try:
+        return json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _pending_save(items: list) -> None:
+    tmp = PENDING_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(PENDING_FILE)
+
+
+def _pending_append(thread_id: int, content: str) -> None:
+    items = _pending_load()
+    items.append({"thread_id": thread_id, "content": content})
+    _pending_save(items)
+    log.warning("ответ буферизован (%d всего): тред %s", len(items), thread_id)
+
+
+def _is_retryable_send_error(e: Exception) -> bool:
+    """Сетевые сбои и 5xx — ретраебельны; 4xx (права/не найдено) — нет."""
+    if isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError)):
+        return True
+    if isinstance(e, discord.HTTPException):
+        return getattr(e, "status", 0) >= 500
+    return False
+
+
+async def safe_send(channel, content: str) -> bool:
+    """Отправка с ретраями на сетевых сбоях. False — надо буферизовать."""
+    last_exc = None
+    for attempt in range(1, SEND_MAX_ATTEMPTS + 1):
+        try:
+            await channel.send(content)
+            return True
+        except discord.HTTPException as e:
+            if not _is_retryable_send_error(e):
+                log.error("постоянная ошибка отправки в %s: %s", getattr(channel, "id", "?"), e)
+                return False
+            last_exc = e
+        except Exception as e:  # ConnectionError и прочее
+            last_exc = e
+        wait = min(30, 3 * 2 ** (attempt - 1))
+        log.warning("отправка не прошла (попытка %d/%d), пауза %ss: %s",
+                    attempt, SEND_MAX_ATTEMPTS, wait, last_exc)
+        await asyncio.sleep(wait)
+    return False
+
+
+async def _resolve_channel(thread_id: int):
+    ch = client.get_channel(thread_id)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(thread_id)
+        except (discord.HTTPException, discord.NotFound, discord.InvalidData):
+            return None
+    return ch
+
+
+async def flush_pending() -> None:
+    """Досылает буферизованные ответы. Если сеть опять лежит — сохраняет остаток
+    и выходит (порядок сообщений сохраняется)."""
+    items = _pending_load()
+    if not items:
+        return
+    if client.is_closed() or not client.is_ready():
+        return
+    log.info("досылаю буфер: %d сообщ.", len(items))
+    remaining: list = []
+    for idx, item in enumerate(items):
+        ch = await _resolve_channel(int(item["thread_id"]))
+        if ch is None:
+            log.error("буфер: тред %s не найден, сообщение отброшено", item["thread_id"])
+            continue
+        ok = await safe_send(ch, item["content"])
+        if not ok:
+            # сеть лежит: сохраняем недоставленное и всё, что после него
+            remaining = items[idx:]
+            break
+    _pending_save(remaining)
+    if not remaining:
+        log.info("буфер пуст — всё доставлено")
+
+
+async def flush_loop():
+    """Фоновый цикл: раз в минут пытается опустошить буфер."""
+    while not client.is_closed():
+        await asyncio.sleep(FLUSH_INTERVAL_S)
+        try:
+            await flush_pending()
+        except Exception:
+            log.exception("ошибка фоновой досылки буфера")
+
+# --------------------------------------------------------------- worker -----
+
+async def process_job(job: dict) -> None:
+    """Полный цикл: субтитры -> LLM -> форматирование -> отправка в тред."""
+    video_id = job["video_id"]
+    thread = await _resolve_channel(job["thread_id"])
+    if thread is None:
+        log.error("тред %s недоступен, задача %s отброшена", job["thread_id"], video_id)
+        return
+
+    status = job.get("status")
+
+    try:
+        transcript = await asyncio.to_thread(fetch_transcript, video_id)
+        summary = await asyncio.to_thread(summarize, transcript)
+    except Exception as e:
+        log.warning("саммари не вышло (%s): %s", video_id, e)
+        summary = PROMPTS.get("error", "Не смог сделать саммари: {reason}").format(reason=e)
+
+    link = f"https://youtu.be/{video_id}"
+    full = format_for_discord(f"**Тезисы: {link}**\n\n{summary}")
+    chunks = truncate_message(full, SPLIT_THRESHOLD)[:MAX_SPLIT_MESSAGES]
+
+    # отправка: при сетевом сбое недоставленные чанки уходят в персистентный буфер
+    for idx, chunk in enumerate(chunks):
+        if await safe_send(thread, chunk):
+            continue
+        for rest in chunks[idx:]:
+            _pending_append(thread.id, rest)
+        log.warning("%s: буферизовано %d/%d чанков (Discord недоступен)",
+                    video_id, len(chunks) - idx, len(chunks))
+        return
+
+    if status:
+        try:
+            await status.delete()
+        except discord.HTTPException:
+            pass
+    log.info("готово: %s (%d чанк(ов))", video_id, len(chunks))
+
+
+async def llm_worker():
+    """Единственный потребитель очереди: LLM-запросы строго по одному."""
+    while True:
+        job = await job_queue.get()
+        try:
+            await process_job(job)
+        except Exception:
+            log.exception("задача %s упала", job.get("video_id"))
+        finally:
+            job_queue.task_done()
 
 
 def build_thread_name(message: discord.Message, video_id: str) -> str:
     """Имя треда: текст сообщения без ссылки, либо 'Видео <id>'."""
     text = YT_RE.sub("", message.content).strip() or f"Видео {video_id}"
-    name = text[:90]
-    return name
+    return text[:90]
 
 
 async def handle(message: discord.Message):
@@ -299,31 +517,37 @@ async def handle(message: discord.Message):
             return
         log.info("тред уже существует, пишу в него: %s", thread.id)
 
-    # субтитры + LLM в отдельном потоке, чтобы не висел event loop
-    try:
-        transcript = await asyncio.to_thread(fetch_transcript, video_id)
-        summary = await asyncio.to_thread(summarize, transcript)
-    except Exception as e:
-        log.warning("саммари не вышло (%s): %s", video_id, e)
-        summary = PROMPTS.get("error", "Не смог сделать саммари: {reason}").format(reason=e)
-
-    # форматирование под Discord (таблицы -> буллеты) и сплит по лимиту
-    link = f"https://youtu.be/{video_id}"
-    full = format_for_discord(f"**Тезисы: {link}**\n\n{summary}")
-    chunks = truncate_message(full, SPLIT_THRESHOLD)[:MAX_SPLIT_MESSAGES]
-    for chunk in chunks:
-        await thread.send(chunk)
-    if status:
+    position = job_queue.qsize()
+    if status and position:
         try:
-            await status.delete()
+            await status.edit(content=f"🎬 Принято, позиция в очереди: {position + 1}")
         except discord.HTTPException:
             pass
-    log.info("готово: %s (%d чанк(ов))", video_id, len(chunks))
 
+    await job_queue.put({
+        "video_id": video_id,
+        "thread_id": thread.id,
+        "message_id": message.id,
+        "status": status,
+    })
+
+# ------------------------------------------------------------------ main ---
+
+_bg_started = False
 
 @client.event
 async def on_ready():
+    global _bg_started
     log.info("запущен как %s (серверов: %d)", client.user, len(client.guilds))
+    if not _bg_started:
+        _bg_started = True
+        asyncio.create_task(llm_worker())
+        asyncio.create_task(flush_loop())
+    # вернулись онлайн — сразу досылаем то, что накопилось за офлайн
+    try:
+        await flush_pending()
+    except Exception:
+        log.exception("досылка буфера при старте упала")
 
 
 @client.event
@@ -335,7 +559,6 @@ async def on_message(message: discord.Message):
     except Exception:
         log.exception("ошибка обработки сообщения %s", message.id)
 
-# ------------------------------------------------------------------- main --
 
 def main():
     missing = [n for n, v in [("DISCORD_BOT_TOKEN", BOT_TOKEN), ("LLM_API_KEY", LLM_API_KEY)] if not v]
