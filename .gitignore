@@ -8,3 +8,5 @@ bot_data.sqlite3*
 # артефакты тестов/линтера
 .pytest_cache/
 .ruff_cache/
+# машинно-специфичный корень Kaspersky (MITM AV хоста), см. entrypoint.sh
+kaspersky_root.cer

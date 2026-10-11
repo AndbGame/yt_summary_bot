@@ -16,5 +16,16 @@ if [ -f /app/requirements.txt ]; then
     pip install --no-cache-dir -q -r /app/requirements.txt || echo "[entrypoint] pip update failed, работаю на встроенных зависимостях"
 fi
 
+# Kaspersky на хосте перехватывает HTTPS (MITM) и подсовывает свой корень —
+# без доверия к нему LLM/статьи ловят «Connection error» (SSL). Это публичная
+# часть корня АВ хоста, файл машинно-специфичен и не коммитится; там, где его
+# нет, шаг просто пропускается. Маркер в комментарии — защита от дублей при
+# restart без пересоздания контейнера.
+if [ -f /app/kaspersky_root.cer ] && ! grep -q "extra-ca kaspersky" /usr/lib/ssl/cert.pem; then
+    { echo; echo "# extra-ca kaspersky (MITM AV на хосте)"; \
+      sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' /app/kaspersky_root.cer; } >> /usr/lib/ssl/cert.pem \
+      && echo "[entrypoint] kaspersky root добавлен в CA-стор"
+fi
+
 echo "[entrypoint] запуск бота..."
 exec python /app/yt_summary_bot.py
