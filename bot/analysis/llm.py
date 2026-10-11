@@ -47,6 +47,13 @@ _DEFAULT_AUTHOR_USER_TEMPLATE = (
     "\n"
     "Напиши обзор автора по этим фактам."
 )
+_DEFAULT_COMMENTS_SYSTEM_PROMPT = (
+    "Ты пишешь краткий обзор реакций: 2-4 тезиса о том, что пишут в комментариях, по-русски."
+)
+_DEFAULT_COMMENTS_USER_TEMPLATE = (
+    "Популярные комментарии (каждый с новой строки):\n{comments}\n\n"
+    "Напиши краткий обзор реакций."
+)
 
 # Кэп max_tokens обзора: обзор короткий; не просим лишнего — провайдеры с жёстким
 # лимитом вывода дают 400 на max_tokens больше их потолка
@@ -258,6 +265,64 @@ class LLMClient:
                 wait = 2 * attempt
                 log.warning(
                     "LLM (обзор автора): %s (попытка %d/%d)",
+                    e, attempt, self.config.llm_max_attempts,
+                )
+                last_exc = e
+            # джиттер, чтобы при пачке запросов не биться синхронно
+            time.sleep(wait + random.uniform(0, 1))
+            attempt += 1
+        raise last_exc or RuntimeError("LLM: исчерпаны попытки")
+
+    def comments_review(self, comments: list[str]) -> str:
+        """Ознакомительный обзор комментариев (текст). Ретраи как у review_author.
+
+        Формат ответа — вольный текст, response_format не отправляется. Бросает
+        исключение после config.llm_max_attempts неудач — пайплайн тогда просто
+        не добавляет блок комментариев.
+        """
+        client = OpenAI(api_key=self.config.llm_api_key, base_url=self.config.llm_base_url)
+        section = self.prompts.get("comments_review") or {}
+        values = {"comments": "\n".join(comments)}
+        template = section.get("user") or _DEFAULT_COMMENTS_USER_TEMPLATE
+        user_content = re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), template)
+        messages = [
+            {"role": "system", "content": section.get("system") or _DEFAULT_COMMENTS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        last_exc = None
+        attempt = 1
+        while attempt <= self.config.llm_max_attempts:
+            try:
+                resp = client.chat.completions.create(
+                    model=self.config.llm_model,
+                    messages=messages,
+                    max_tokens=min(self.config.llm_max_tokens, _AUTHOR_MAX_TOKENS_CAP),
+                    temperature=0.3,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                if not content:
+                    raise RuntimeError("LLM вернул пустой ответ")
+                return content
+            except RateLimitError as e:
+                wait = _backoff_seconds(e, attempt, self.config.llm_max_backoff)
+                log.warning(
+                    "LLM (обзор комментариев): лимит запросов (попытка %d/%d), пауза %.0fс",
+                    attempt, self.config.llm_max_attempts, wait,
+                )
+                last_exc = e
+            except (APIConnectionError, APITimeoutError) as e:
+                wait = _backoff_seconds(e, attempt, self.config.llm_max_backoff)
+                log.warning(
+                    "LLM (обзор комментариев): сетевой сбой (попытка %d/%d), пауза %.0fс: %s",
+                    attempt, self.config.llm_max_attempts, wait, e,
+                )
+                last_exc = e
+            except RuntimeError as e:
+                # пустой ответ — короткая пауза и повтор
+                wait = 2 * attempt
+                log.warning(
+                    "LLM (обзор комментариев): %s (попытка %d/%d)",
                     e, attempt, self.config.llm_max_attempts,
                 )
                 last_exc = e

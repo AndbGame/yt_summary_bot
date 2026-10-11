@@ -13,7 +13,7 @@ import json
 import re
 
 # Фиксированный список видов блоков: рендер и валидация бюджетов знают ровно их
-KINDS = ["brief", "context", "theses", "detailed", "author"]
+KINDS = ["brief", "context", "theses", "detailed", "comments", "author"]
 
 # Маркер обрезки: ведущий пробел, чтобы приклеивался к тексту читаемо
 TRUNCATION_MARKER = " …(обрезано)"
@@ -274,9 +274,14 @@ def render_report_messages(
             packed.append(buf)
         messages.extend("**Подробно**\n\n" + "\n".join(chunk) for chunk in packed)
 
+    # комментарии — про материал, обзор автора — финальный контекст (последним)
+    comments = next((b for b in report.blocks if b.kind == "comments"), None)
+    if comments is not None:
+        messages.append(f"**Комментарии**\n\n{_fit(comments.body_md, budgets, 'comments')}")
+
     author = next((b for b in report.blocks if b.kind == "author"), None)
     if author is not None:
-        messages.append(f"**Обзор автора**\n\n{_fit(author.body_md, budgets, 'author')}")
+        messages.append(f"**Об авторе**\n\n{_fit(author.body_md, budgets, 'author')}")
 
     return messages
 

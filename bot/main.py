@@ -12,6 +12,7 @@ from pathlib import Path
 
 from bot import discord_app
 from bot.analysis.author import YouTubeAuthorFactsProvider
+from bot.analysis.comments import YouTubeCommentsProvider
 from bot.analysis.llm import LLMClient
 from bot.analysis.prompts import load_prompts
 from bot.config import ENV_NAMES, BotConfig
@@ -74,8 +75,10 @@ def build_deps(config: BotConfig) -> Deps:
         llm_lock=asyncio.Lock(),
         # фаза 4-5: реестр экстракторов (YouTube — первый, article — fallback,
         # порядок = приоритет), джобы и дедуп сообщений — репозитории БД
-        # (переживают рестарт)
+        # (переживают рестарт); провайдер топ-комментариев — ознакомительный
+        # обзор реакций (UX-итерация)
         router=Router([YoutubeExtractor(), ArticleExtractor()]),
+        comments=YouTubeCommentsProvider(),
         jobs=store.jobs,
         dedup=store.dedup,
     )

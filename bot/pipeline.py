@@ -45,7 +45,7 @@ from typing import Any
 
 import discord
 
-from bot.analysis.author import AuthorFacts, facts_to_dict
+from bot.analysis.author import AUTHOR_PROMPTS_VER, AuthorFacts, facts_to_dict
 from bot.analysis.prompts import load_prompts
 from bot.analysis.report import Report, ReportBlock, render_report_messages, validate_budgets
 from bot.config import BotConfig
@@ -96,6 +96,8 @@ class Deps:
     router: Any = None  # bot.router.Router | фейк из conftest
     jobs: Any = None  # JobStore | фейк из conftest — исходы джоб в БД
     dedup: Any = None  # DedupStore | фейк из conftest — дедуп по message_id
+    # UX-итерация: провайдер топ-комментариев (ознакомительный обзор реакций)
+    comments: Any = None  # YouTubeCommentsProvider | фейк из conftest
 
 
 def _content_hash(content: str) -> str:
@@ -122,7 +124,7 @@ def _author_block(ref, facts, review: str) -> ReportBlock:
     """Автор-блок отчёта; data связывает блок с ключом кеша авторов (HIT-путь)."""
     return ReportBlock(
         "author",
-        title="Обзор автора",
+        title="Об авторе",
         body_md=review,
         data={
             "platform": getattr(ref, "platform", "") or "",
@@ -149,6 +151,22 @@ def _author_facts_from_row(row) -> AuthorFacts:
     except (TypeError, ValueError):
         stored = AuthorFacts()
     return AuthorFacts(name=row.get("display_name") or stored.name, url=stored.url)
+
+
+def _author_row_fresh(row, deps: "Deps") -> bool:
+    """Строка автора свежа: не устарела по TTL И записана текущей версией
+    автор-промпта (AUTHOR_PROMPTS_VER) — смена формата обзора перестраивает
+    старые строки при первом же запросе, не дожидаясь TTL."""
+    if not row or not row.get("review_json"):
+        return False
+    if str(row.get("prompts_ver") or "") != AUTHOR_PROMPTS_VER:
+        return False
+    authors = deps.authors
+    try:
+        return authors.is_fresh(row, _author_ttl_seconds(deps))
+    except Exception as e:
+        log.warning("проверка свежести автора упала: %s", e)
+        return False
 
 
 async def _attach_author_block(
@@ -183,9 +201,7 @@ async def _attach_author_block(
     # кеш автора — ДО сети: свежая строка спасает без страницы канала и LLM
     try:
         row = authors.get(platform, handle) if authors is not None else None
-        fresh = bool(row) and bool(row.get("review_json")) and authors.is_fresh(
-            row, _author_ttl_seconds(deps)
-        )
+        fresh = _author_row_fresh(row, deps)
     except Exception as e:
         # сбой кеша автора — деградация до без-автор-блока, а не падение джобы:
         # строка считается отсутствующей, обзор строится в LLM как на промахе
@@ -226,10 +242,42 @@ async def _attach_author_block(
                 getattr(facts, "name", "") or "",
                 json.dumps(facts_to_dict(facts), ensure_ascii=False),
                 review,
-                prompts_ver,
+                AUTHOR_PROMPTS_VER,
             )
         except Exception:
             log.exception("обзор автора %s/%s не закеширован", platform, handle)
+
+
+async def _attach_comments_block(
+    deps: "Deps", report: Report, url: str, budgets: dict | None
+) -> None:
+    """MISS-путь комментариев: топ популярных комментариев -> краткий LLM-обзор.
+
+    Блок добавляется в отчёт ДО кеширования — как автор: на кеш-хите блок
+    приходит из payload без повторной добычи. Любой сбой (провайдера нет,
+    комментарии отключены/недоступны, обзор не вышел) оставляет отчёт без
+    блока: доставка разбора не зависит от обзора комментариев.
+    """
+    provider = getattr(deps, "comments", None)
+    if provider is None:
+        return
+    try:
+        comments = await asyncio.to_thread(provider.get, url)
+    except Exception as e:
+        log.warning("комментарии не получены (%s): %s", url, e)
+        return
+    if not comments:
+        return
+    try:
+        review = await llm_call(deps, "comments_review", comments)
+    except Exception as e:
+        log.warning("обзор комментариев не вышел (%s): %s", url, e)
+        return
+    report.blocks.append(ReportBlock("comments", body_md=review))
+    # бюджет comments-блока проверяется отдельно — как у автора: блок появляется
+    # после общей валидации отчёта (превышение не фатально, рендер укоротит)
+    for warning in validate_budgets(Report([report.blocks[-1]]), budgets):
+        log.warning("%s: %s", url, warning)
 
 
 def _queue_stale_author_refresh(deps: "Deps", report: Report) -> None:
@@ -253,7 +301,7 @@ def _queue_stale_author_refresh(deps: "Deps", report: Report) -> None:
         return
     try:
         row = authors.get(platform, handle)
-        fresh = row is not None and authors.is_fresh(row, _author_ttl_seconds(deps))
+        fresh = row is not None and _author_row_fresh(row, deps)
     except Exception as e:
         # сбой кеша автора — деградация до без-автор-блока, а не падение джобы:
         # не зная свежести строки, фон не ставим (отчёт уже доставлен из payload)
@@ -419,6 +467,7 @@ async def process_job(deps: Deps, job: dict) -> None:
                 # MISS: автор-блок строится до кеширования — в кеш попадает
                 # отчёт уже с автором
                 await _attach_author_block(deps, report, url, prompts_ver, budgets)
+                await _attach_comments_block(deps, report, url, budgets)
                 # в кеш кладём только успешный разбор: ошибки extract/LLM
                 # повторно разберутся на следующей попытке
                 deps.reports.put(canonical, prompts_ver, REPORT_SCHEMA, report.to_json(), content_hash)

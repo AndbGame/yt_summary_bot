@@ -53,7 +53,7 @@ def _sig(report):
 
 class TestReportBlock:
     def test_kinds_fixed_list(self):
-        assert KINDS == ["brief", "context", "theses", "detailed", "author"]
+        assert KINDS == ["brief", "context", "theses", "detailed", "comments", "author"]
 
     def test_defaults_are_empty(self):
         block = ReportBlock("brief")
@@ -375,7 +375,7 @@ class TestRenderMessages:
         )
         assert render_report_messages(report, URL) == [
             "**Кратко**\n\nСуть.",
-            "**Обзор автора**\n\nтекст обзора",
+            "**Об авторе**\n\nтекст обзора",
         ]
 
     def test_missing_blocks_skipped(self):

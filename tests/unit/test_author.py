@@ -247,3 +247,29 @@ def _ref(handle):
     from bot.analysis.author import AuthorRef
 
     return AuthorRef(platform="youtube", handle=handle)
+
+class TestChannelScaleFacts:
+    """Масштаб канала (подписчики/видео/с года) — best-effort из разметки шапки."""
+
+    def test_metadata_parts_ru(self):
+        from bot.analysis.author import _channel_scale_facts
+
+        page = (
+            '"metadataParts":[{"text":{"content":"246 подписчиков"},"accessibilityLabel":"246 подписчиков"},'
+            '{"text":{"content":"5 видео"}}]'
+        )
+        assert _channel_scale_facts(page) == {"подписчики": "246 подписчиков", "видео": "5 видео"}
+
+    def test_english_and_joined(self):
+        from bot.analysis.author import _channel_scale_facts
+
+        page = '"content":"1.53M subscribers" ..."content":"812 videos" ...joinedDateText":{"content":"Joined Mar 14, 2011"}'
+        extra = _channel_scale_facts(page)
+        assert extra["подписчики"] == "1.53M subscribers"
+        assert extra["видео"] == "812 videos"
+        assert extra["на канале с"] == "Joined Mar 14, 2011"
+
+    def test_empty_page_no_keys(self):
+        from bot.analysis.author import _channel_scale_facts
+
+        assert _channel_scale_facts("<html></html>") == {}

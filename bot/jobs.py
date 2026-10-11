@@ -11,9 +11,8 @@ import asyncio
 import json
 import logging
 
-from bot.analysis.author import AuthorRef, facts_to_dict
-from bot.analysis.prompts import load_prompts
-from bot.pipeline import Deps, _author_ttl_seconds, llm_call, process_job
+from bot.analysis.author import AUTHOR_PROMPTS_VER, AuthorRef, facts_to_dict
+from bot.pipeline import Deps, _author_row_fresh, llm_call, process_job
 
 log = logging.getLogger("yt-summary")
 
@@ -93,7 +92,7 @@ async def _refresh_author(deps: Deps, task: dict) -> None:
     # джобой/фоновым воркером она могла быть уже обновлена — дублируемый LLM-
     # вызов не нужен, задача просто рассасывается
     row = authors.get(platform, handle)
-    if authors.is_fresh(row, _author_ttl_seconds(deps)):
+    if _author_row_fresh(row, deps):
         log.info("фоновое обновление: обзор %s/%s уже свежий", platform, handle)
         return
     ref = AuthorRef(platform=platform, handle=handle)
@@ -103,14 +102,11 @@ async def _refresh_author(deps: Deps, task: dict) -> None:
         log.info("фоновое обновление: факты %s/%s недоступны", platform, handle)
         return
     review = await llm_call(deps, "review_author", facts)
-    prompts = deps.prompts
-    if prompts is None:
-        prompts = load_prompts()
     authors.put(
         platform,
         handle,
         getattr(facts, "name", "") or "",
         json.dumps(facts_to_dict(facts), ensure_ascii=False),
         review,
-        str(prompts.get("version", "0")),
+        AUTHOR_PROMPTS_VER,
     )

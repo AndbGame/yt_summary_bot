@@ -44,6 +44,34 @@ _OG_PROPERTY_RE = re.compile(r"""property\s*=\s*["']og:description["']""", re.IG
 _CONTENT_RE = re.compile(r"""content\s*=\s*["'](.*?)["']""", re.IGNORECASE | re.DOTALL)
 _YOUTUBE_SUFFIX = " - YouTube"
 
+# Версия автор-промптов: отдельная от версии content_analysis — изменение
+# формата обзора инвалидирует кеш АВТОРОВ (authors.prompts_ver), не трогая
+# кеш отчётов. Старые развёрнутые обзоры после смены формата считаются
+# устаревшими и перестраиваются при первом же запросе.
+AUTHOR_PROMPTS_VER = "2"
+
+# Масштаб канала — из разметки страницы (шапка канала, metadataParts),
+# best-effort: подписчики, число видео, дата создания. Форматы ru/en зависят
+# от локали ответа; joinedDateText есть не во всех раскладках.
+_SUBS_RE = re.compile(r'"content":"([^"]{1,40}?(?:подписчик|subscriber)[^"]{0,8})"')
+_VIDEOS_RE = re.compile(r'"content":"(\d[\d\s.,]{0,15}(?:тыс\.?|млн)?\s*(?:видео|videos))"')
+_JOINED_RE = re.compile(r'joinedDateText"\s*:\s*\{"content":"([^"]+)"')
+
+
+def _channel_scale_facts(page: str) -> dict:
+    """Подписчики/видео/дата канала из HTML — что нашлось, то в extra."""
+    extra: dict = {}
+    match = _SUBS_RE.search(page)
+    if match:
+        extra["подписчики"] = html.unescape(match.group(1)).strip()
+    match = _VIDEOS_RE.search(page)
+    if match:
+        extra["видео"] = html.unescape(match.group(1)).strip()
+    match = _JOINED_RE.search(page)
+    if match:
+        extra["на канале с"] = html.unescape(match.group(1)).strip()
+    return extra
+
 
 _DEFAULT_FETCH = None  # присваивается сразу после определения: oembed_meta зовёт до инжекта
 
@@ -213,7 +241,12 @@ class YouTubeAuthorFactsProvider:
         name = _title_name(page)
         if name is None:
             return None
-        return AuthorFacts(name=name, url=url, description=_og_description(page) or "")
+        # масштаб канала (подписчики/видео/с года) — best-effort: не нашлось,
+        # обзор всё равно строится по описанию
+        return AuthorFacts(
+            name=name, url=url, description=_og_description(page) or "",
+            extra=_channel_scale_facts(page),
+        )
 
     def _page(self, url: str) -> str | None:
         """HTML страницы канала: только 2xx считаются успехом, остальное — None."""

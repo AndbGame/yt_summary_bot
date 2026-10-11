@@ -132,6 +132,11 @@ class FakeLLM:
         self.review_error = review_error
         self.calls = []
         self.review_calls = []
+        # UX-итерация: обзор комментариев (по умолчанию есть; None-результат
+        # не нужен — None значит «блок не строится», фейк ошибок не имитирует)
+        self.comments_review_text = "Тестовый обзор комментариев"
+        self.comments_error = None
+        self.comments_calls = []
 
     def analyze_content(self, transcript):
         self.calls.append(transcript)
@@ -149,6 +154,14 @@ class FakeLLM:
         if self.review_error is not None:
             raise self.review_error
         return self.review
+
+    def comments_review(self, comments):
+        """Фейк deps.llm.comments_review (UX-итерация): текст обзора комментариев
+        или исключение; вызовы считаются отдельно."""
+        self.comments_calls.append(comments)
+        if self.comments_error is not None:
+            raise self.comments_error
+        return self.comments_review_text
 
 
 class FakeClient:
@@ -233,6 +246,22 @@ class FakeAuthorFactsProvider:
     def get_channel(self, ref):
         self.channel_calls.append(ref)
         return self.get_channel_result
+
+
+class FakeCommentsProvider:
+    """Фейк deps.comments: get(url) -> список строк комментариев или None
+    (None — комментарии недоступны/отключены, блок не строится)."""
+
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def get(self, url):
+        self.calls.append(url)
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 class InMemoryAuthorStore:
@@ -478,12 +507,23 @@ def make_message():
 def make_llm():
     """Фабрика LLM-фейка: make_llm(analysis_json={...}), make_llm(raw="..."),
     make_llm(error=exc); для автор-пути фазы 3 — make_llm(review="обзор")
-    и make_llm(review_error=exc)."""
+    и make_llm(review_error=exc); для обзора комментариев — comments_review_text
+    / comments_error (поля фейка)."""
 
     def _make(analysis_json=None, raw=None, error=None, review=None, review_error=None):
         return FakeLLM(
             analysis_json=analysis_json, raw=raw, error=error, review=review, review_error=review_error
         )
+
+    return _make
+
+
+@pytest.fixture
+def make_comments_provider():
+    """Фабрика фейка deps.comments: make_comments_provider(result=[...], error=exc)."""
+
+    def _make(result=None, error=None):
+        return FakeCommentsProvider(result=result, error=error)
 
     return _make
 
@@ -584,6 +624,7 @@ def make_deps(tmp_path, make_client, make_llm):
         router=None,
         jobs=None,
         dedup=None,
+        comments=None,
     ):
         if config is None:
             config = BotConfig(bot_token="test-token", llm_api_key="test-key")
@@ -620,6 +661,10 @@ def make_deps(tmp_path, make_client, make_llm):
                 jobs = default_jobs
             if dedup is None:
                 dedup = default_dedup
+        if comments is None:
+            # провайдер без результатов: существующие сценарии комментариев
+            # не задействуют, точечные тесты подставляют свои ответы
+            comments = FakeCommentsProvider()
         # поля фаз 3-4: если уже объявлены в Deps — передаём конструктору; пока их
         # нет (тесты написаны под контракт раньше реализации, TDD) — донашиваем
         # setattr'ом, чтобы все существующие тесты оставались зелёными и до, и
@@ -631,7 +676,7 @@ def make_deps(tmp_path, make_client, make_llm):
             "llm_lock": llm_lock,
         }
         phase4 = {"router": router, "jobs": jobs, "dedup": dedup}
-        injectable = {**phase3, **phase4}
+        injectable = {**phase3, **phase4, "comments": comments}
         declared = {f.name for f in dataclasses.fields(Deps)}
         deps = Deps(
             config=config,

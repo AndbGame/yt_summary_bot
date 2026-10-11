@@ -32,6 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from bot.analysis.author import AUTHOR_PROMPTS_VER
 from bot.analysis.report import Report, ReportBlock
 from bot.config import BotConfig
 from bot.pipeline import REPORT_SCHEMA, process_job
@@ -94,7 +95,7 @@ def _payload_with_author(review="СТАРЫЙ ОБЗОР"):
             ReportBlock("theses", body_md="- тезис один"),
             ReportBlock(
                 "author",
-                title="Обзор автора",
+                title="Об авторе",
                 body_md=review,
                 data={
                     "platform": "youtube",
@@ -185,7 +186,7 @@ class TestAuthorStoreFailureDegradation:
         assert any("**Кратко**" in c for c in thread.sent), "отчёт доставлен"
         assert all("Не смог разобрать" not in c for c in thread.sent), "error-сообщения нет"
         assert llm.review_calls == [facts], "сбой кеша автора — как промах: обзор построен"
-        assert thread.sent[-1] == "**Обзор автора**\n\nОбзор автора: тест"
+        assert thread.sent[-1] == "**Об авторе**\n\nОбзор автора: тест"
         # запись нового обзора сквозь обёртку дошла до настоящего store
         assert store.authors.get("youtube", CHANNEL_HANDLE) is not None
 
@@ -210,7 +211,7 @@ class TestAuthorStoreFailureDegradation:
 
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
-        assert thread.sent[-1] == "**Обзор автора**\n\nСТАРЫЙ ОБЗОР", "отчёт доставлен"
+        assert thread.sent[-1] == "**Об авторе**\n\nСТАРЫЙ ОБЗОР", "отчёт доставлен"
         assert deps.background_queue.qsize() == 0, "не зная свежести строки, фон не ставим"
         assert llm.calls == [] and llm.review_calls == []
 
@@ -239,8 +240,8 @@ class TestMissPath:
 
         # финальное сообщение треда — обзор автора (§9: автор последним)
         assert thread.sent, "сообщения не отправлены"
-        assert thread.sent[-1] == "**Обзор автора**\n\nОбзор автора: тест"
-        assert sum("**Обзор автора**" in c for c in thread.sent) == 1
+        assert thread.sent[-1] == "**Об авторе**\n\nОбзор автора: тест"
+        assert sum("**Об авторе**" in c for c in thread.sent) == 1
         # MISS-путь фазы 4: ref по url джобы, факты канала отдельно
         assert provider.ref_calls == [URL]
         assert len(provider.channel_calls) == 1
@@ -252,14 +253,16 @@ class TestMissPath:
         assert row is not None, "обзор автора закеширован в authors"
         assert row["review_json"] == "Обзор автора: тест"
         assert row["display_name"] == "Имя Канала"
-        assert row["prompts_ver"] == str(deps.prompts["version"])
+        # строки автора версионируются ОТДЕЛЬНО от отчётов: смена формата обзора
+        # (AUTHOR_PROMPTS_VER) перестраивает их, не трогая кеш отчётов
+        assert row["prompts_ver"] == AUTHOR_PROMPTS_VER
         # в кеш отчётов попал отчёт УЖЕ с автор-блоком (блок добавлен до кеширования)
         payload = deps.reports.get(*_cache_key(deps, extractor))
         assert payload is not None
         cached = Report.from_json(payload)
         assert [b.kind for b in cached.blocks] == ["brief", "theses", "author"]
         author = cached.blocks[-1]
-        assert author.title == "Обзор автора"
+        assert author.title == "Об авторе"
         assert author.body_md == "Обзор автора: тест"
         assert author.data == {
             "platform": "youtube",
@@ -299,7 +302,7 @@ class TestMissPath:
         assert provider.channel_calls == [], (
             "свежая строка спасает: страница канала (get_channel) не качается"
         )
-        assert thread.sent[-1] == "**Обзор автора**\n\nСВЕЖИЙ ОБЗОР ИЗ КЕША"
+        assert thread.sent[-1] == "**Об авторе**\n\nСВЕЖИЙ ОБЗОР ИЗ КЕША"
         assert deps.background_queue.qsize() == 0, "MISS-путь не ставит фоновых задач"
         # в кеш отчётов ушёл блок с фактами ИЗ строки кеша (display_name, facts_json)
         payload = deps.reports.get(*_cache_key(deps, extractor))
@@ -334,7 +337,7 @@ class TestMissPath:
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         assert llm.review_calls == [facts], "устаревшая строка на промахе — обзор строится сейчас"
-        assert thread.sent[-1] == "**Обзор автора**\n\nНОВЫЙ ОБЗОР"
+        assert thread.sent[-1] == "**Об авторе**\n\nНОВЫЙ ОБЗОР"
         row = deps.authors.get("youtube", CHANNEL_HANDLE)
         assert row["review_json"] == "НОВЫЙ ОБЗОР"
         assert row["analyzed_at"] > STALE_ANALYZED_AT, "строка обновлена свежим штампом"
@@ -357,7 +360,7 @@ class TestMissPath:
 
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
-        assert all("**Обзор автора**" not in c for c in thread.sent), "ref'а нет — блока нет"
+        assert all("**Об авторе**" not in c for c in thread.sent), "ref'а нет — блока нет"
         assert provider.ref_calls == [URL], "ref добывается по url джобы"
         assert provider.channel_calls == [], "без ref факты канала не запрашиваются"
         assert llm.review_calls == []
@@ -387,7 +390,7 @@ class TestMissPath:
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         assert any("**Кратко**" in c for c in thread.sent), "сам отчёт доставлен"
-        assert all("**Обзор автора**" not in c for c in thread.sent)
+        assert all("**Об авторе**" not in c for c in thread.sent)
         assert llm.review_calls == []
         assert deps.authors.get("youtube", CHANNEL_HANDLE) is None
         payload = deps.reports.get(*_cache_key(deps, extractor))
@@ -414,7 +417,7 @@ class TestMissPath:
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         assert any("**Кратко**" in c for c in thread.sent), "сам отчёт доставлен"
-        assert all("**Обзор автора**" not in c for c in thread.sent)
+        assert all("**Об авторе**" not in c for c in thread.sent)
         assert deps.authors.get("youtube", CHANNEL_HANDLE) is None
         payload = deps.reports.get(*_cache_key(deps, extractor))
         assert payload is not None
@@ -439,7 +442,7 @@ class TestMissPath:
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         assert any("**Кратко**" in c for c in thread.sent)
-        assert all("**Обзор автора**" not in c for c in thread.sent)
+        assert all("**Об авторе**" not in c for c in thread.sent)
         assert llm.review_calls == []
         assert deps.authors.get("youtube", CHANNEL_HANDLE) is None
 
@@ -470,7 +473,7 @@ class TestHitPath:
 
         assert provider.ref_calls == [], "на кеш-хите провайдер фактов не зовётся"
         assert llm.calls == [] and llm.review_calls == [], "на кеш-хите LLM не зовётся"
-        assert thread.sent[-1] == "**Обзор автора**\n\nСТАРЫЙ ОБЗОР"
+        assert thread.sent[-1] == "**Об авторе**\n\nСТАРЫЙ ОБЗОР"
         assert deps.background_queue.qsize() == 0, "свежая строка автора — фон не нужен"
 
     def test_hit_with_stale_row_user_gets_old_body_and_background_refresh(
@@ -496,7 +499,7 @@ class TestHitPath:
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         # юзер сразу получает старый обзор, обновление — в фоне (никогда не ждёт)
-        assert thread.sent[-1] == "**Обзор автора**\n\nСТАРЫЙ ОБЗОР"
+        assert thread.sent[-1] == "**Об авторе**\n\nСТАРЫЙ ОБЗОР"
         assert llm.review_calls == [], "обзор обновляется фоном, не синхронно"
         assert deps.background_queue.qsize() == 1
         task = deps.background_queue.get_nowait()
@@ -522,7 +525,7 @@ class TestHitPath:
 
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
-        assert thread.sent[-1] == "**Обзор автора**\n\nСТАРЫЙ ОБЗОР"
+        assert thread.sent[-1] == "**Об авторе**\n\nСТАРЫЙ ОБЗОР"
         assert deps.background_queue.qsize() == 1, "строки автора нет — фоновая задача поставлена"
 
     def test_hit_without_author_block_is_silent(
@@ -547,7 +550,7 @@ class TestHitPath:
 
         assert provider.ref_calls == [], "нет author-блока — провайдер не зовётся (без сети)"
         assert llm.calls == [] and llm.review_calls == []
-        assert all("**Обзор автора**" not in c for c in thread.sent)
+        assert all("**Об авторе**" not in c for c in thread.sent)
         assert deps.background_queue.qsize() == 0
 
     def test_hit_author_block_without_platform_handle_is_silent(
@@ -571,7 +574,7 @@ class TestHitPath:
         report = Report(
             [
                 ReportBlock("brief", body_md="Суть видео."),
-                ReportBlock("author", title="Обзор автора", body_md="СТАРЫЙ ОБЗОР", data={}),
+                ReportBlock("author", title="Об авторе", body_md="СТАРЫЙ ОБЗОР", data={}),
             ]
         )
         _seed_report(deps, extractor, report.to_json())
@@ -579,7 +582,7 @@ class TestHitPath:
         asyncio.run(process_job(deps, _job(extractor, thread.id)))
 
         assert provider.ref_calls == [] and llm.calls == [] and llm.review_calls == []
-        assert thread.sent[-1] == "**Обзор автора**\n\nСТАРЫЙ ОБЗОР"
+        assert thread.sent[-1] == "**Об авторе**\n\nСТАРЫЙ ОБЗОР"
         assert deps.background_queue.qsize() == 0
 
     def test_ttl_taken_from_config(
