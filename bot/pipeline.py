@@ -6,18 +6,22 @@
 контент добывает экстрактор из deps.router по kind (extract -> SourceDocument).
 Единственная сеть в ядре — за портом экстрактора и LLM.
 
+Тред создаётся ПОД ИСХОДНЫМ СООБЩЕНИЕМ (_create_thread по channel_id/message_id)
+в последний момент — когда разбор уже готов: без полезного результата бот в
+Discord не появляется вовсе, ни сообщений-статусов, ни сообщений об ошибках.
+Джобы старого формата (thread_id в payload, до «тред вместе с разбором») пишут
+в существующий тред. 160004 («тред под сообщением уже существует») —
+переиспользование треда, не ошибка.
+
 Отчёт доставляется по сообщениям (кратко -> тезисы -> разделы), каждое отдельно
 проходит format_for_discord (LLM мог нарушить запрет таблиц) и чанк-сплит; при
 сбое отправки в персистентный буфер уходит ПОЛНЫЙ хвост отчёта — остаток чанков
 текущего сообщения плюс все последующие сообщения, — порядок доставки сохраняется.
 
 Контент мог исчезнуть у источника: при ошибке extract'а отдаём последний разбор
-этого источника из кеша (любой content_hash), без кеша — error-сообщение. Ошибка
-extract/LLM теперь не глотается: process_job сначала информирует пользователя
-(error-сообщение), закрывает статус (только если доставка прошла — при
-буферизации статус остаётся до досылки хвоста), затем ПРОБРАСЫВАЕТ исключение —
-llm_worker помечает джобу failed в БД (mark_failed), и она не повторяется после
-рестарта.
+этого источника из кеша (любой content_hash); без кеша — тишина: причина
+остаётся в логе и в БД, а process_job ПРОБРАСЫВАЕТ исключение — llm_worker
+помечает джобу failed (mark_failed), и она не повторяется после рестарта.
 
 Обзор автора (фазы 3-4) строится только на промахе кеша: провайдер даёт
 AuthorRef по url (get_author_ref), затем кеш авторов читается ДО сети —
@@ -26,20 +30,20 @@ AuthorRef по url (get_author_ref), затем кеш авторов читае
 блок добавляется в отчёт до кеширования. На попадании автор-блок берётся из
 payload как есть, а устаревшая или отсутствующая строка автора даёт фоновую
 задачу обновления — пользователь никогда не ждёт фона. Любой сбой автор-пути
-не роняет джобу.
+не роняет джобу. Автор-блок появляется только при собранном разборе — без
+полезной информации о видео обзор автора не строится вовсе.
 
 «По ссылке нет статьи» (NotAnArticle, фаза 5) — не сетевой сбой: страница
 отдаётся, но статьи в ней нет и после ретрая не появится. Разбор мог уже лежать
 в кеше (контент исчез/стал не-статьёй позже) — тогда отдаётся прошлый разбор;
-при пустом кеше статус редактируется вежливым отказом. В обоих случаях джоба
-завершается штатно (mark_done воркером), error-сообщение в тред не уходит.
+при пустом кеше — тишина (как при любом сбое без результата), тред не
+создаётся. В обоих случаях джоба завершается штатно (mark_done воркером).
 """
 
 import asyncio
 import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,14 +63,6 @@ log = logging.getLogger("yt-summary")
 # Версия схемы отчёта — часть ключа кеша (ARCHITECTURE.md §6): фаза 2 перевела
 # отчёт на блоки (JSON-ответ LLM), старые записи summary-1 инвалидируются сами.
 REPORT_SCHEMA = "blocks-1"
-
-_ERROR_TEMPLATE = "Не смог сделать разбор этого видео: {reason}"
-
-# Вежливый отказ при NotAnArticle — дублируется дефолтом на случай вырожденного
-# prompts.yaml; боевой текст живёт в prompts.yaml (ключ not_an_article)
-_NOT_AN_ARTICLE_DEFAULT = (
-    "🤔 По ссылке не нашлось статьи с текстом. Если это видео — дай ссылку на YouTube."
-)
 
 
 @dataclass
@@ -362,7 +358,12 @@ async def _deliver(deps: "Deps", thread, messages: list[str], label: str) -> boo
 
 
 async def _close_status(status) -> None:
-    """Закрывает статусное сообщение («готово»/ошибка уже доставлены в тред)."""
+    """Удаляет статусное сообщение джобы старого формата («принято в работу»).
+
+    Новый формат джоб статусных сообщений не создаёт (бот молчит до готового
+    разбора) — для них status None и вызов ничего не делает; для старых
+    оставлять висящее «принято» — тот же шум, от которого ушли.
+    """
     if not status:
         return
     try:
@@ -371,31 +372,93 @@ async def _close_status(status) -> None:
         pass
 
 
-async def process_job(deps: Deps, job: dict) -> None:
-    """Полный цикл: extract -> кеш/LLM -> рендер -> отправка в тред.
+async def find_existing_thread(message):
+    """Ищет тред, созданный из этого сообщения (его id == message.id).
 
-    Контракт исхода джобы (фаза 4): успех и «тред недоступен» возвращаются
-    штатно (воркер поставит mark_done), любой сбой разбора пробрасывается
-    ПОСЛЕ доставки error-сообщения и закрытия статуса (воркер поставит
-    mark_failed — джоба не повторится после рестарта, ошибка уже показана).
+    Нужно, когда тред под сообщением уже есть (160004): создан до падения
+    процесса (создание и доставка не атомарны) или вторым источником события.
+    """
+    ch = message.channel
+    for t in list(getattr(ch, "threads", []) or []):
+        if t.id == message.id:
+            return t
+    try:
+        async for t in ch.archived_threads(limit=50):
+            if t.id == message.id:
+                return t
+    except discord.HTTPException:
+        pass
+    return None
+
+
+async def _create_thread(deps: Deps, job: dict):
+    """Создаёт тред под исходным сообщением джобы (channel_id + message_id).
+
+    Вызывается, когда разбор уже готов (и закеширован): без полезного
+    результата тред не создаётся вовсе. 160004 — переиспользуем существующий
+    тред под этим сообщением. None — создать/найти не вышло (нет прав, лимиты
+    Discord, сообщение/канал недоступны): вызывающий код пробросит ошибку,
+    а повторная ссылка попробует снова — разбор уже в кеше.
+    """
+    channel = await resolve_channel(deps.client, job.get("channel_id"))
+    if channel is None:
+        log.error(
+            "канал %s недоступен, тред не создать (%s)", job.get("channel_id"), job["url"]
+        )
+        return None
+    try:
+        message = await channel.fetch_message(job.get("message_id"))
+    except Exception as e:
+        log.error(
+            "сообщение %s недоступно (%s), тред не создать (%s)",
+            job.get("message_id"), e, job["url"],
+        )
+        return None
+    try:
+        return await message.create_thread(
+            name=job.get("thread_name") or f"Разбор {job['url']}"[:90],
+            auto_archive_duration=1440,
+        )
+    except discord.HTTPException as e:
+        if getattr(e, "code", None) == 160004 or "160004" in str(e):
+            thread = await find_existing_thread(message)
+            if thread is not None:
+                log.info("тред уже существует, пишу в него: %s", thread.id)
+                return thread
+        log.error("не смог создать тред для %s: %s", job["url"], e)
+        return None
+
+
+async def process_job(deps: Deps, job: dict) -> None:
+    """Полный цикл: extract -> кеш/LLM -> рендер -> тред -> отправка.
+
+    UX-контракт: бот появляется в Discord только с готовым разбором. Тред
+    создаётся под исходным сообщением в последний момент — когда отчёт уже
+    собран; сбой без полезного результата остаётся в логе и в БД (воркер
+    поставит mark_failed) — ни сообщения об ошибке, ни треда. Исключение
+    пробрасывается ПОСЛЕ удаления статусного сообщения (джобы старого формата).
     """
     url = job["url"]
     canonical = job["canonical_id"]
     extractor = deps.router.by_name(job["kind"])
-    thread = await resolve_channel(deps.client, job["thread_id"])
-    if thread is None:
-        log.error("тред %s недоступен, задача %s отброшена", job["thread_id"], url)
-        return
-
     status = job.get("status")
     link = url
+
+    if job.get("thread_id"):
+        # старый формат джобы (до «тред вместе с разбором»): тред уже есть —
+        # резолвим сразу; недоступный тред отбрасывает джобу, делать нечего
+        thread = await resolve_channel(deps.client, job["thread_id"])
+        if thread is None:
+            log.error("тред %s недоступен, задача %s отброшена", job["thread_id"], url)
+            return
+    else:
+        thread = None
 
     try:
         if extractor is None:
             # kind джобы нет в реестре (экстрактор убрали из build_deps, джоба
             # из старой версии): человеческий текст вместо AttributeError на
-            # None.extract — попадает в error-путь ниже (сообщение пользователю,
-            # закрытие статуса, проброс — воркер пометит джобу failed)
+            # None.extract — попадает в error-путь ниже (лог, mark_failed)
             raise RuntimeError(f"неизвестный тип источника: {job['kind']}")
 
         # промпты могут быть не заданы (обратная совместимость) — лениво читаем
@@ -415,20 +478,13 @@ async def process_job(deps: Deps, job: dict) -> None:
             # «по ссылке нет статьи» — не сетевой сбой (ветка ДО общего except):
             # страница отдаётся, но статьи в ней нет и после ретрая не появится.
             # Разбор мог уже лежать в кеше (контент исчез или стал не-статьёй
-            # позже) — отдаём прошлый разбор, как и в ветке сетевого сбоя:
-            # свежесть здесь недостижима, а без фолбэка пользователь не получил
-            # бы ничего. Кеш пуст — вежливый отказ, error-сообщение в тред не
-            # уходит, исключение не пробрасывается — воркер завершит джобу
-            # штатно (mark_done)
+            # позже) — отдаём прошлый разбор, как и в ветке сетевого сбоя.
+            # Кеш пуст — тишина: тред не создаётся, джоба завершается штатно
+            # (mark_done), отказ пользователю не пишется
             cached = deps.reports.get_latest(canonical, prompts_ver, REPORT_SCHEMA)
             if cached is None:
                 log.info("по ссылке нет статьи (%s): %s", canonical, no_article)
-                rejection = str(prompts.get("not_an_article") or _NOT_AN_ARTICLE_DEFAULT)
-                if status:
-                    try:
-                        await status.edit(content=rejection)
-                    except discord.HTTPException:
-                        pass
+                await _close_status(status)
                 return
             log.info(
                 "текст по ссылке исчез/стал не-статьей, отдаю прошлый разбор: %s", no_article
@@ -439,6 +495,8 @@ async def process_job(deps: Deps, job: dict) -> None:
             # устаревшее: контент мог исчезнуть у источника навсегда, и тогда без
             # фолбэка пользователь не получит ничего, хотя разбор уже лежит в
             # кеше под прежним content_hash (свежий хэш посчитать не из чего).
+            # Кеш пуст — полезного результата нет: тишина (никаких сообщений и
+            # треда), исключение уходит воркеру на mark_failed
             cached = deps.reports.get_latest(canonical, prompts_ver, REPORT_SCHEMA)
             if cached is None:
                 raise
@@ -457,15 +515,14 @@ async def process_job(deps: Deps, job: dict) -> None:
             else:
                 report = await llm_call(deps, "analyze_content", doc.content)
                 if not report.blocks:
-                    # пустой отчёт нельзя ни кешировать, ни отправлять: пользователь
-                    # останется без сообщений с висящим статусом
+                    # пустой отчёт нельзя ни кешировать, ни отправлять
                     raise RuntimeError("LLM вернул пустой отчёт")
                 # превышение бюджета не фатально: рендер укоротит блок, но в логе
                 # остаётся след для настройки промптов
                 for warning in validate_budgets(report, budgets):
                     log.warning("%s: %s", canonical, warning)
                 # MISS: автор-блок строится до кеширования — в кеш попадает
-                # отчёт уже с автором
+                # отчёт уже с автором (автор только при собранном разборе)
                 await _attach_author_block(deps, report, url, prompts_ver, budgets)
                 await _attach_comments_block(deps, report, url, budgets)
                 # в кеш кладём только успешный разбор: ошибки extract/LLM
@@ -481,30 +538,24 @@ async def process_job(deps: Deps, job: dict) -> None:
             # до TITLE_CLIP, полное — в имени треда), без метаданных —
             # маскированная ссылка <url>: кликабельна, встраивания не создаёт
             messages[0] = f"**{_disclaimer_header(job)}**\n\n{messages[0]}"
+
+        # тред создаётся, когда разбор готов (и уже в кеше на промахе): сбой
+        # создания не теряет разбор, повторная ссылка попробует снова
+        if thread is None:
+            thread = await _create_thread(deps, job)
+            if thread is None:
+                raise RuntimeError(
+                    "тред не создан (нет прав, лимиты Discord или сообщение недоступно)"
+                )
     except Exception as e:
+        # сообщение об ошибке не пишется: без полезного разбора бот молчит,
+        # причина — в логе и в БД (воркер поставит mark_failed). Статусное
+        # сообщение старого формата — шум бота, удаляем
         log.warning("разбор не вышел (%s): %s", canonical, e)
-        prompts = deps.prompts
-        if prompts is None:
-            # промпты не переданы в Deps: ленивое чтение с диска — один раз,
-            # выше, для ключа кеша; при заданном deps.prompts error-ветка
-            # диск не читает (шаблон берётся из памяти)
-            prompts = load_prompts()
-        # LLM/провайдер могут вернуть текст с mention — не позволяем боту тегать
-        # людей: @everyone/@here и начало <@-пинга вырезаются из причины ошибки
-        reason = re.sub(r"@everyone|@here|<@", "", str(e))
-        error_text = prompts.get("error", _ERROR_TEMPLATE).format(reason=reason)
-        delivered = await _deliver(
-            deps, thread, [f"**{_disclaimer_header(job)}**\n\n{error_text}"], canonical
-        )
-        # джоба упала: статус закрываем ТОЛЬКО если error-сообщение доставлено —
-        # при буферизации оно остаётся (симметрично success-ветке: досылка хвоста
-        # из outbox продолжит разбор в треде). Пробрасываем исключение —
-        # llm_worker запишет mark_failed в БД
-        if delivered:
-            await _close_status(status)
+        await _close_status(status)
         raise
 
     if await _deliver(deps, thread, messages, canonical):
-        # статус закрывается только после полной доставки; при буферизации он
-        # остаётся: досылка хвоста из outbox продолжит разбор в треде
+        # статус старого формата удаляется после полной доставки; при
+        # буферизации он остаётся: досылка хвоста из outbox продолжит разбор
         await _close_status(status)

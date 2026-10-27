@@ -28,7 +28,7 @@ VIDEO_ID = "cachevid001"
 URL = f"https://youtu.be/{VIDEO_ID}"
 TRANSCRIPT = f"субтитры {VIDEO_ID}"
 THREAD_ID = 4242
-PROMPTS = {"version": "2", "error": "упс: {reason}"}
+PROMPTS = {"version": "2"}
 
 
 def _content_hash(transcript: str) -> str:
@@ -190,7 +190,7 @@ class TestCacheIsolation:
         deps_v2 = make_deps(
             thread=thread,
             llm=llm,
-            prompts={"version": "2", "error": "упс: {reason}"},
+            prompts={"version": "2"},
             reports=store.reports,
             router=router,
         )
@@ -199,7 +199,7 @@ class TestCacheIsolation:
         deps_v3 = make_deps(
             thread=thread,
             llm=llm,
-            prompts={"version": "3", "error": "упс: {reason}"},
+            prompts={"version": "3"},
             reports=store.reports,
             router=router,
         )
@@ -256,13 +256,13 @@ class TestErrorsNotCached:
         with pytest.raises(RuntimeError):
             asyncio.run(process_job(deps, _job(extractor)))
 
-        assert len(thread.sent) == 1, "пользователь получил сообщение об ошибке"
+        assert thread.sent == [], "бот молчит: сообщений об ошибках нет"
         assert store.reports.get(*_cache_key(extractor, deps)) is None, "ошибка не кешируется"
 
     def test_extraction_failure_is_not_cached(
         self, make_deps, make_thread, make_llm, make_extractor, make_router, store
     ):
-        # кеш пуст: фолбэк взять неоткуда — обычная error-ветка
+        # кеш пуст: фолбэк взять неоткуда — бот молчит, джоба падает (mark_failed)
         thread = make_thread(THREAD_ID)
         extractor = make_extractor(extract_error=RuntimeError("нет субтитров"))
         deps = make_deps(
@@ -276,8 +276,7 @@ class TestErrorsNotCached:
         with pytest.raises(RuntimeError):
             asyncio.run(process_job(deps, _job(extractor)))
 
-        assert len(thread.sent) == 1
-        assert "упс" in thread.sent[0], "пустой кеш — обычное error-сообщение"
+        assert thread.sent == []
         assert store.reports.get(*_cache_key(extractor, deps)) is None, "ошибка не кешируется"
 
 

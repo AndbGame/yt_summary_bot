@@ -36,8 +36,8 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/unit/test_youtube.py` | YT-регекс (все форматы, ложные срабатывания), имя треда | `bot/sources/youtube.py` |
 | `tests/unit/test_jobs.py` | очередь, живучесть воркера при исключениях | `bot/jobs.py` |
 | `tests/unit/test_import_clean.py` | импорт `bot.*` без side effects (холодный импорт в подпроцессе без токенов/.env) | весь пакет |
-| `tests/e2e/test_pipeline.py` | полный путь job: чанки/формат, ошибка → сообщение, офлайн → буфер → досылка, error-путь без диска | `bot/pipeline.py` |
-| `tests/e2e/test_handle.py` | роутинг ссылки, дедуп, 160004, Forbidden, позиция в очереди | `bot/discord_app.py` |
+| `tests/e2e/test_pipeline.py` | полный путь job: чанки/формат, сбой → тишина без треда, офлайн → буфер → досылка, тред из сообщения воркером | `bot/pipeline.py` |
+| `tests/e2e/test_handle.py` | роутинг ссылки, дедуп, имя треда в payload, тишина в чате | `bot/discord_app.py` |
 | `tests/e2e/test_discord_app.py` | on_ready: однократный старт воркеров, flush при старте | `bot/discord_app.py` |
 | `tests/e2e/test_main.py` | build_deps (реальная композиция), main(): валидация/env-имена, запуск | `bot/main.py` |
 | `tests/unit/test_store.py` | SQLite: схема reports/outbox, WAL, идемпотентные миграции, FIFO, параллельные записи, close/reopen | `bot/store/` |
@@ -46,7 +46,7 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/e2e/test_pipeline_cache.py` | кеш: промах/хит/перезапуск/смена версии промптов, ошибки не кешируются | `bot/pipeline.py`, `bot/store/reports.py` |
 | `tests/e2e/test_legacy_migration.py` | миграция pending_replies.json → БД: атомарный merge одной транзакцией, битые/кривые файлы → .corrupted | `bot/main.py` |
 | `tests/unit/test_report.py` | Report/ReportBlock: from_analysis, JSON roundtrip, терпеливый парсер, бюджеты, прогрессивный рендер (таймкоды, context, автор последним) | `bot/analysis/report.py` |
-| `tests/e2e/test_report_flow.py` | полный путь JSON-отчёта в тред, обрезка по бюджетам, мусор от LLM → error-промпт | `bot/pipeline.py`, `bot/analysis/report.py` |
+| `tests/e2e/test_report_flow.py` | полный путь JSON-отчёта в тред, обрезка по бюджетам, мусор от LLM → тишина, не кешируется | `bot/pipeline.py`, `bot/analysis/report.py` |
 | `tests/unit/test_author.py` | AuthorRef/AuthorFacts, провайдер: oEmbed/og:description, все сбои → None, URL-форматы UC/@ | `bot/analysis/author.py` |
 | `tests/unit/test_author_store.py` | authors-таблица: roundtrip, PK, миграция v2→v3, is_fresh TTL-границы | `bot/store/authors.py` |
 | `tests/e2e/test_author_flow.py` | автор-путь: MISS (факты→обзор→блок в кеш), HIT без сети, устаревший → фон, дедуп refresh, llm_lock не даёт пересечений analyze×review, деградация при сбое кеша автора | `bot/pipeline.py`, `bot/jobs.py` |
@@ -54,9 +54,9 @@ live-smoke вручную. Всё остальное — быстрые дете
 | `tests/unit/test_router.py` | Route-границы, приоритет реестра, by_name, не-ссылка → None | `bot/router.py` |
 | `tests/unit/test_jobs_store.py` | jobs-таблица: put/take_new FIFO/mark_done/mark_failed, unicode payload | `bot/store/jobs.py` |
 | `tests/unit/test_dedup_store.py` | дедуп по message_id: True/False, персистентность | `bot/store/dedup.py` |
-| `tests/e2e/test_recovery.py` | восстановление джоб после рестарта: attach статуса, state=done/failed, полный цикл | `bot/discord_app.py`, `bot/jobs.py` |
+| `tests/e2e/test_recovery.py` | восстановление джоб после рестарта (старый и новый формат), state=done/failed, полный цикл | `bot/discord_app.py`, `bot/jobs.py` |
 | `tests/unit/test_article_extractor.py` | статьи: canonical-нормализация (tracking/схема/userinfo), хвостовая пунктуация URL, readability-извлечение, порог 500, SSRF-гвард, лимит 10 МБ | `bot/sources/article.py` |
-| `tests/e2e/test_article_flow.py` | полный путь статьи (без таймкодов), utm-дубликат → кеш-хит, junk → вежливый отказ (или кеш-хит), сайт 500 → error | `bot/pipeline.py`, `bot/sources/article.py` |
+| `tests/e2e/test_article_flow.py` | полный путь статьи (без таймкодов), utm-дубликат → кеш-хит, junk → тишина без треда (или кеш-хит), сайт 500 → тишина + mark_failed | `bot/pipeline.py`, `bot/sources/article.py` |
 
 ## E2E in-process: как устроено
 
@@ -75,12 +75,13 @@ live-smoke вручную. Всё остальное — быстрые дете
 | Сценарий | Ожидание |
 |---|---|
 | длинный саммари с таблицей и кодом | чанки ≤1900, таблицы сконвертированы, фенсы целы, `(i/N)` |
-| нет субтитров / LLM упала | одно сообщение об ошибке из `prompts.yaml`, статус удалён |
+| нет субтитров / LLM упала | тишина: ни сообщения, ни треда; причина в логе и в БД (mark_failed) |
 | Discord 5xx при отправке | чанки ушли в буфер; после «восстановления» — досылка по порядку |
 | тред удалён | сообщение отброшено, буфер не растёт вечно |
 | повторное сообщение с той же ссылкой | одна задача в очереди |
 | (фаза 1) повторная ссылка на разобранное видео | ответ из кеша, ноль LLM-вызовов |
 | (фаза 2+) отчёт из блоков | сообщение 1 = кратко+тезисы, далее подробно, в конце автор |
+| (UX-итерация) новая ссылка | в чате ничего, тред создан воркером только с готовым разбором |
 
 ## Компонентные тесты (по мере миграции)
 
@@ -101,11 +102,11 @@ live-smoke вручную. Всё остальное — быстрые дете
 а не проверить логику. Чек-лист сценария на тестовом сервере:
 
 1. бот поднялся (`on_ready` в логах, нет ошибок интентов);
-2. пост YouTube-ссылки → тред создан, статус → саммари в разумное время;
-3. видео без субтитров → внятное сообщение об ошибке;
+2. пост YouTube-ссылки → в чате ничего, тред создан с готовым саммари в разумное время;
+3. видео без субтитров → тишина (в чате и без треда), причина в логах контейнера;
 4. повторный пост той же ссылки → (после фазы 1) мгновенный ответ из кеша;
 5. `docker compose restart` во время обработки → задача не потерялась
-   (после фазы 4), зависших статусов нет.
+   (после фазы 4), тред для недоделанной джобы создаётся после рестарта.
 
 В CI не запускается; токены — из секретов окружения, не из коммита.
 

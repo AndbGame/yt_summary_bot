@@ -1,4 +1,4 @@
-"""Discord-адаптер: события, треды, статусные сообщения, дедуп, recovery.
+"""Discord-адаптер: события, дедуп, джобы, recovery.
 
 discord.Client создаётся ТОЛЬКО в фабрике create_client(): импорт пакета
 остаётся чистым — без токенов, без .env и без клиентов (см.
@@ -8,6 +8,12 @@ attach_handlers(), когда deps уже собран.
 Фаза 4: маршрут сообщения определяет Router (реестр экстракторов), дедуп и
 джобы живут в БД (in-memory set удалён — дедуп переживает рестарт); недоделанные
 джобы после рестарта возвращаются в очередь recover_jobs'ом ДО старта воркеров.
+
+UX-контракт: handle() ничего не пишет в чат и не создаёт тред — бот появляется
+в Discord только с готовым разбором. Джоба несёт всё нужное воркеру для треда:
+channel_id/message_id исходного сообщения, thread_name (имя треда) и
+display-метаданные для заголовка разбора; создание треда и доставка — в
+bot.pipeline.process_job.
 """
 
 import asyncio
@@ -49,34 +55,21 @@ def thread_name_from_message(text: str, route, title: str = "", author: str = ""
     return stripped[:90] if stripped else f"Разбор {route.url}"[:90]
 
 
-async def find_existing_thread(message: discord.Message):
-    """Ищет тред, созданный из этого сообщения (его id == message.id).
-
-    Нужно после перезапуска бота: тред мог быть создан прошлым запуском,
-    а дедуп в БД его не помнит — Discord не даст создать второй тред (160004).
-    """
-    ch = message.channel
-    for t in list(getattr(ch, "threads", []) or []):
-        if t.id == message.id:
-            return t
-    try:
-        async for t in ch.archived_threads(limit=50):
-            if t.id == message.id:
-                return t
-    except discord.HTTPException:
-        pass
-    return None
-
-
 async def _fetch_status(client, job: dict):
-    """Статусное сообщение восстановленной джобы; любой сбой — None.
+    """Статусное сообщение джобы старого формата; любое отсутствие/сбой — None.
 
-    Тред мог быть удалён, статусное сообщение — стёрто вручную: разбор потерять
-    нельзя, а статус опционален (пайплайн допускает джобу без статуса).
+    Новый формат джоб (тред создаёт воркер вместе с разбором) статусных
+    сообщений не создаёт: без thread_id/status_message_id возвращаем None
+    сразу. Тред мог быть удалён, статусное сообщение — стёрто вручную: разбор
+    потерять нельзя, а статус опционален (пайплайн допускает джобу без статуса).
     """
+    thread_id = job.get("thread_id")
+    status_message_id = job.get("status_message_id")
+    if thread_id is None or status_message_id is None:
+        return None
     try:
-        thread = client.get_channel(job.get("thread_id"))
-        return await thread.fetch_message(job.get("status_message_id"))
+        thread = client.get_channel(thread_id)
+        return await thread.fetch_message(status_message_id)
     except Exception:
         return None
 
@@ -102,7 +95,13 @@ async def recover_jobs(deps) -> None:
 
 
 async def handle(message: discord.Message, deps) -> None:
-    """Роутинг: ссылка -> экстрактор -> дедуп -> тред + статус -> джоба в БД и очередь."""
+    """Роутинг: ссылка -> экстрактор -> дедуп -> джоба в БД и очередь.
+
+    Никаких сообщений в чат и никакого треда здесь: бот появляется в Discord
+    только с готовым разбором — тред создаёт воркер (process_job), когда отчёт
+    уже собран. Describe-метаданные и имя треда считаются здесь, пока жив
+    route (границы ссылки нужны для имени из текста сообщения).
+    """
     route = deps.router.route(message.content or "")
     if route is None:
         return
@@ -115,12 +114,6 @@ async def handle(message: discord.Message, deps) -> None:
 
     log.info("источник %s в #%s от %s", url, message.channel, message.author)
 
-    status = None
-    try:
-        status = await message.reply("🎬 Разбираю ссылку, готовлю тезисы...")
-    except discord.HTTPException:
-        pass
-
     # describe: название/автор для имени треда и заголовка разбора (без ссылок).
     # Сеть — в поток; сбой не фатален: тред и заголовок будут из запасных вариантов
     display_title = display_author = ""
@@ -132,44 +125,15 @@ async def handle(message: discord.Message, deps) -> None:
     if meta:
         display_title, display_author = meta
 
-    try:
-        thread = await message.create_thread(
-            name=thread_name_from_message(message.content, route, display_title, display_author),
-            auto_archive_duration=1440,
-        )
-    except discord.Forbidden:
-        log.error("нет права Create Public Threads в #%s", message.channel)
-        if status:
-            await status.edit(content="⚠️ Нет прав создать тред в этом канале.")
-        return
-    except discord.HTTPException as e:
-        # 160004: тред под этим сообщением уже есть (создан до рестарта бота
-        # или вторым источником события) — переиспользуем, не сдаёмся
-        if getattr(e, "code", None) == 160004 or "160004" in str(e):
-            thread = await find_existing_thread(message)
-        if thread is None:
-            log.error("не смог создать тред: %s", e)
-            if status:
-                await status.edit(content="⚠️ Не удалось создать тред (лимиты Discord?).")
-            return
-        log.info("тред уже существует, пишу в него: %s", thread.id)
-
-    position = deps.queue.qsize()
-    if status and position:
-        try:
-            await status.edit(content=f"🎬 Принято, позиция в очереди: {position + 1}")
-        except discord.HTTPException:
-            pass
-
-    # payload в БД — без status-объекта (не сериализуется); статус прикрепляется
-    # к джобе в очереди, после рестарта восстанавливается по status_message_id
     payload = {
         "kind": route.extractor.name,
         "url": url,
         "canonical_id": canonical,
-        "thread_id": thread.id,
+        "channel_id": message.channel.id,
         "message_id": message.id,
-        "status_message_id": status.id if status else None,
+        "thread_name": thread_name_from_message(
+            message.content, route, display_title, display_author
+        ),
         "display_title": display_title,
         "display_author": display_author,
     }
@@ -178,18 +142,12 @@ async def handle(message: discord.Message, deps) -> None:
         job_id = jobs.put(payload) if jobs is not None else None
     except Exception:
         # БД недоступна: без записи джоба пережила бы рестарт только молчаливой
-        # потерей — в очередь её не ставим, пользователь получает честный отказ
-        # (исключение не пробрасывается: on_message не должен логировать падение)
+        # потерей — в очередь её не ставим. Пользователю ничего не пишем:
+        # сообщений о сбоях больше нет (исключение не пробрасывается: on_message
+        # не должен логировать падение)
         log.exception("джоба не поставлена в БД (%s)", url)
-        if status:
-            try:
-                await status.edit(
-                    content="⚠️ Не удалось поставить разбор в очередь, попробуйте позже."
-                )
-            except discord.HTTPException:
-                pass
         return
-    await deps.queue.put({**payload, "job_id": job_id, "status": status})
+    await deps.queue.put({**payload, "job_id": job_id})
 
 
 def attach_handlers(client: discord.Client, deps) -> discord.Client:

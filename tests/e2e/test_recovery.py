@@ -2,14 +2,14 @@
 
 Сценарии «падения процесса»:
 - джоба записана в БД (state=new), но не обработана — recover_jobs находит её и
-  ставит в очередь, статусное сообщение прикрепляется через fetch_message;
+  ставит в очередь (статусное сообщение старого формата прикрепляется через
+  fetch_message, у нового формата статусов нет);
 - обработка воркером переводит джобу в state=done;
-- упавшая process_job -> state=failed, текст ошибки записан в БД. ВАЖНАЯ
-  семантика ошибки: process_job сначала информирует пользователя (error-
-  сообщение в треде), затем пробрасывает исключение — llm_worker помечает джобу
-  failed. Пользователь не остаётся с висящим статусом, а упавшая джоба не
-  повторяется после рестарта (ошибка уже показана);
-- восстановленная джоба обрабатывается до конца — отчёт доставлен в тред.
+- упавшая process_job -> state=failed, текст ошибки записан в БД. UX-семантика:
+  пользователь ничего не получает (бот молчит при сбое), а упавшая джоба не
+  повторяется после рестарта;
+- восстановленная джоба обрабатывается до конца — отчёт доставлен в тред; у
+  джобы нового формата треда ещё нет — воркер создаёт его из сообщения.
 
 Всё на настоящем Store во временном файле + фейках Discord/LLM/экстрактора;
 сети нет. «Рестарт» эмулируется тем, что джоба попадает в БД напрямую
@@ -49,6 +49,8 @@ def _sql(db_path, statement, params=()):
 
 
 def _payload(extractor):
+    """Джоба старого формата (thread_id + status_message_id): тред и статусное
+    сообщение созданы прошлой версией бота, джоба пережила его рестарт."""
     return {
         "kind": extractor.name,
         "url": URL,
@@ -56,6 +58,19 @@ def _payload(extractor):
         "thread_id": THREAD_ID,
         "message_id": MESSAGE_ID,
         "status_message_id": STATUS_MESSAGE_ID,
+    }
+
+
+def _new_payload(extractor, channel, msg):
+    """Джоба нового формата (UX-итерация): треда ещё нет, воркер создаст его
+    из сообщения по channel_id/message_id."""
+    return {
+        "kind": extractor.name,
+        "url": URL,
+        "canonical_id": extractor.canonical_id(URL),
+        "channel_id": channel.id,
+        "message_id": msg.id,
+        "thread_name": "Восстановленный тред",
     }
 
 
@@ -186,8 +201,8 @@ class TestJobLifecycleInDb:
     def test_failed_extraction_marked_failed_with_error(
         self, make_deps, make_thread, make_llm, make_extractor, make_router, store, db_path
     ):
-        # экстрактор не добыл контент: пользователь получает error-сообщение,
-        # джоба помечается failed, текст ошибки записан в БД
+        # экстрактор не добыл контент: бот молчит (пользователь ничего не
+        # получает), джоба помечается failed, текст ошибки записан в БД
         thread = make_thread(THREAD_ID)
         extractor = make_extractor(extract_error=RuntimeError("нет доступных субтитров"))
         deps = make_deps(
@@ -200,7 +215,7 @@ class TestJobLifecycleInDb:
         )
         payload = _payload(extractor)
         job_id = deps.jobs.put(payload)
-        deps.queue.put_nowait({"job_id": job_id, **payload})
+        deps.queue.put_nowait({**payload, "job_id": job_id})
 
         _drain(deps)
 
@@ -209,8 +224,8 @@ class TestJobLifecycleInDb:
         assert error is not None and "нет доступных субтитров" in error, "ошибка записана"
         assert deps.jobs.count_new() == 0
         assert deps.jobs.take_new() == []
-        # пользователь информирован: error-путь сработал до mark_failed
-        assert any("нет доступных субтитров" in c for c in thread.sent)
+        # бот молчит: сообщений об ошибках больше нет
+        assert thread.sent == []
 
     def test_recovered_job_delivers_report_after_restart(
         self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router, store
@@ -245,3 +260,41 @@ class TestJobLifecycleInDb:
         assert thread.sent[0].startswith(f"**Разбор: <{URL}>**"), "отчёт доставлен в тред"
         assert status.deleted, "статусное сообщение закрыто"
         assert deps.jobs.count_new() == 0, "джоба завершена, повторного восстановления нет"
+
+    def test_recovered_new_format_job_creates_thread_and_delivers(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router, store
+    ):
+        # «процесс умер» до создания треда: джоба нового формата в БД без
+        # thread_id — после рестарта воркер создаёт тред из сообщения и доставляет
+        from bot.discord_app import recover_jobs
+
+        thread = make_thread(THREAD_ID)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(),
+            reports=store.reports,
+            jobs=store.jobs,
+            dedup=store.dedup,
+            router=make_router([extractor]),
+        )
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", thread=thread, channel=channel)
+        deps.client.channels[channel.id] = channel
+        deps.jobs.put(_new_payload(extractor, channel, msg))
+
+        asyncio.run(recover_jobs(deps))
+        job = asyncio.run(deps.queue.get())
+        assert job.get("status") is None, "у джобы нового формата нет статусного сообщения"
+        deps.queue.task_done()
+        deps.queue.put_nowait(job)
+
+        _drain(deps)
+
+        assert msg.thread_kwargs == {
+            "name": "Восстановленный тред",
+            "auto_archive_duration": 1440,
+        }, "тред создан из сообщения после рестарта"
+        assert thread.sent, "отчёт доставлен в созданный тред"
+        assert thread.sent[0].startswith(f"**Разбор: <{URL}>**")
+        assert deps.jobs.count_new() == 0

@@ -51,7 +51,8 @@ class FakeStatus:
     """Статусное сообщение-фейк: запоминает удаление и правки текста.
 
     id нужен фазе 4: handle() кладёт status_message_id в джобу, recovery по
-    нему находит сообщение через fetch_message.
+    нему находит сообщение через fetch_message. Новый формат джоб статусных
+    сообщений не создаёт — фейк нужен только старым payload'ам.
     """
 
     def __init__(self, id=None):
@@ -66,30 +67,60 @@ class FakeStatus:
         self.edits.append(content)
 
 
+class FakeChannel:
+    """Текстовый канал-фейк: хранит сообщения для fetch_message; threads и
+    archived_threads — для find_existing_thread (воркер создаёт тред из
+    сообщения джобы, 160004 ищет существующий тред по id сообщения)."""
+
+    def __init__(self, id=10):
+        self.id = id
+        self.messages = {}
+        self.threads = []
+
+    async def fetch_message(self, message_id):
+        msg = self.messages.get(message_id)
+        if msg is None:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="x"), "нет сообщения")
+        return msg
+
+    def archived_threads(self, limit=50):
+        async def _gen():
+            for t in list(self.threads):
+                yield t
+
+        return _gen()
+
+
 # Уникальные id сообщений между тестами: дедуп (фаза 4 — в БД) keyed by
 # message.id, уникальные id изолируют тесты без сброса общего состояния.
 _message_ids = itertools.count(1001)
 
 
 class FakeMessage:
-    """Сообщение-фейк для handle(): reply() -> статус, create_thread() -> тред.
+    """Сообщение-фейк: reply() -> статус (никто его больше не зовёт — UX-контракт
+    «бот молчит до готового разбора»), create_thread() -> тред.
 
-    thread может быть тредом (обычный путь), исключением (создание падает)
-    или None (создание треда не ожидалось). status_id — id статусного сообщения
-    (фаза 4: попадает в джобу как status_message_id). kwargs create_thread
-    записываются в thread_kwargs — так тесты проверяют имя треда.
+    Автоматически регистрируется в channel.messages, если канал умеет хранить
+    сообщения (FakeChannel): воркер пайплайна создаёт тред из сообщения по
+    channel_id/message_id. thread может быть тредом (обычный путь), исключением
+    (создание падает) или None. kwargs create_thread записываются в
+    thread_kwargs — тесты проверяют имя треда; reply-тексты — в replies.
     """
 
     def __init__(self, content, *, id=None, thread=None, channel=None, status_id=None):
         self.id = id if id is not None else next(_message_ids)
         self.content = content
         self.author = SimpleNamespace(bot=False)
-        self.channel = channel if channel is not None else SimpleNamespace(id=10, threads=[])
+        self.channel = channel if channel is not None else FakeChannel()
+        if hasattr(self.channel, "messages"):
+            self.channel.messages[self.id] = self
         self.status = FakeStatus(id=status_id)
         self._thread = thread
         self.thread_kwargs = None
+        self.replies = []
 
     async def reply(self, text=""):
+        self.replies.append(text)
         return self.status
 
     async def create_thread(self, **kwargs):
@@ -165,7 +196,8 @@ class FakeLLM:
 
 
 class FakeClient:
-    """Фейк discord-клиента: get_channel из словаря, fetch_channel всегда NotFound."""
+    """Фейк discord-клиента: get_channel/fetch_channel из словаря (fetch — тоже:
+    воркер резолвит канал джобы по channel_id); чего нет в словаре — NotFound."""
 
     def __init__(self, channels=None):
         self.channels = dict(channels or {})
@@ -176,6 +208,8 @@ class FakeClient:
         return self.channels.get(channel_id)
 
     async def fetch_channel(self, channel_id):
+        if channel_id in self.channels:
+            return self.channels[channel_id]
         raise discord.NotFound(SimpleNamespace(status=404, reason="x"), "нет такого канала")
 
     def is_closed(self):
@@ -489,6 +523,18 @@ def _default_job_dedup_stores(tmp_path):
 def make_thread():
     """Фабрика тредов: make_thread(4242)."""
     return FakeThread
+
+
+@pytest.fixture
+def make_channel():
+    """Фабрика текстовых каналов: make_channel(10). Канал джобы нужно
+    зарегистрировать в клиенте (deps.client.channels[ch.id] = ch), чтобы воркер
+    резолвил его по channel_id и создавал тред из сообщения."""
+
+    def _make(id=10):
+        return FakeChannel(id)
+
+    return _make
 
 
 @pytest.fixture

@@ -10,9 +10,13 @@ monkeypatch bot.pipeline.fetch_transcript больше не нужен: конт
 ПОСООБЩЕНИЯМ (кратко -> тезисы -> подробно по разделам); при сбое отправки в
 персистентный буфер уходит ПОЛНЫЙ хвост отчёта.
 
-Ошибка добычи контента/LLM: пользователь получает error-сообщение (error-путь),
-а джоба помечается упавшей — process_job пробрасывает исключение после
-доставки, llm_worker ставит mark_failed (см. tests/e2e/test_recovery.py).
+UX-итерация: тред джобы нового формата создаётся воркером ПОД ИСХОДНЫМ
+СООБЩЕНИЕМ (channel_id/message_id + thread_name) прямо перед доставкой — без
+полезного разбора треда нет. Ошибка добычи контента/LLM: бот молчит (сообщений
+об ошибках больше нет), process_job пробрасывает исключение — llm_worker ставит
+mark_failed (см. tests/e2e/test_recovery.py). Джобы старого формата (thread_id
+в payload) пишут в существующий тред — так живут и старые тесты, и джобы из БД
+прошлых версий.
 """
 
 import asyncio
@@ -21,7 +25,7 @@ from types import SimpleNamespace
 import discord
 import pytest
 
-from bot.analysis.report import Report, ReportParseError, render_report_messages
+from bot.analysis.report import Report, render_report_messages
 from bot.delivery import render
 from bot.pipeline import process_job
 
@@ -48,7 +52,7 @@ MINIMAL_ANALYSIS = {"brief": "Коротко и ясно"}
 
 
 def _job(extractor, thread_id, **extra):
-    """Джоба нового формата (фаза 4): canonical_id считает экстрактор."""
+    """Джоба старого формата (фаза 4): тред уже существует, canonical_id считает экстрактор."""
 
     job = {
         "kind": extractor.name,
@@ -58,6 +62,32 @@ def _job(extractor, thread_id, **extra):
     }
     job.update(extra)
     return job
+
+
+def _channel_job(extractor, channel, msg, **extra):
+    """Джоба нового формата (UX-итерация): треда ещё нет — воркер создаст его
+    из сообщения (channel_id/message_id + thread_name) перед доставкой."""
+
+    job = {
+        "kind": extractor.name,
+        "url": URL,
+        "canonical_id": extractor.canonical_id(URL),
+        "channel_id": channel.id,
+        "message_id": msg.id,
+        "thread_name": "Тест треда",
+    }
+    job.update(extra)
+    return job
+
+
+class ThreadAlreadyExistsError(discord.HTTPException):
+    """Фейк ошибки Discord 160004 «тред под этим сообщением уже существует»."""
+
+    def __init__(self):
+        self.response = SimpleNamespace(status=400, reason="x")
+        self.status = 400
+        self.code = 160004
+        self.text = "тред уже существует"
 
 
 class BrokenThread:
@@ -204,126 +234,64 @@ class TestHappyPath:
 
 
 class TestErrorPath:
-    def test_extraction_failure_posts_error_message(
-        self, make_deps, make_thread, make_status, make_extractor, make_router
+    def test_extraction_failure_is_silent_no_thread(
+        self, make_deps, make_thread, make_channel, make_message, make_extractor, make_router
     ):
-        # экстрактор не добыл контент: error-сообщение пользователю, статус закрыт;
-        # исключение пробрасывается — воркер пометит джобу failed
-        thread = make_thread(4242)
-        status = make_status()
+        # нет сабтитров/другой сбой добычи без кеша: полезного результата нет —
+        # бот молчит и тред не создаёт; исключение пробрасывается — воркер
+        # пометит джобу failed (не повторится после рестарта)
         extractor = make_extractor(extract_error=RuntimeError("нет доступных субтитров"))
-        deps = make_deps(thread=thread, router=make_router([extractor]))
+        deps = make_deps(thread=make_thread(4242), router=make_router([extractor]))
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", channel=channel)
 
         with pytest.raises(RuntimeError):
-            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
+            asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
 
-        assert len(thread.sent) == 1
-        # причина попадает в шаблон ошибки из prompts.yaml ({reason})
-        assert "нет доступных субтитров" in thread.sent[0]
-        assert status.deleted
+        assert msg.thread_kwargs is None, "тред без полезного разбора не создаётся"
 
-    def test_llm_failure_posts_error_message(
-        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
+    def test_llm_failure_is_silent_no_thread(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router
     ):
         thread = make_thread(4242)
-        status = make_status()
         extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(
             thread=thread,
             llm=make_llm(error=RuntimeError("LLM недоступна")),
             router=make_router([extractor]),
         )
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", channel=channel)
 
         with pytest.raises(RuntimeError):
-            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
+            asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
 
-        assert len(thread.sent) == 1
-        assert "LLM недоступна" in thread.sent[0]
-        assert status.deleted
+        assert msg.thread_kwargs is None, "тред без полезного разбора не создаётся"
+        assert thread.sent == [], "в существующий тред error-сообщение тоже не пишется"
 
-    def test_error_message_without_disk_prompts_read(
-        self, monkeypatch, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
+    def test_unknown_kind_raises_silently(
+        self, make_deps, make_thread, make_extractor, make_router
     ):
-        # битый prompts.yaml на диске не мешает error-сообщению: шаблон берётся
-        # из Deps.prompts (в памяти), диск error-ветка не перечитывает
+        # kind джобы нет в реестре экстракторов: исключение с человеческим
+        # текстом (а не AttributeError на None.extract); пользователь ничего
+        # не получает, воркер пометит джобу failed
         thread = make_thread(4242)
-        status = make_status()
-        extractor = make_extractor(transcripts={URL: "субтитры"})
-        deps = make_deps(
-            thread=thread,
-            llm=make_llm(error=RuntimeError("LLM недоступна")),
-            prompts={"error": "упс: {reason}"},
-            router=make_router([extractor]),
-        )
-
-        disk_reads = []
-
-        def _broken_yaml(*args, **kwargs):
-            # эмуляция битого prompts.yaml + счётчик обращений к диску
-            disk_reads.append(1)
-            raise RuntimeError("битый prompts.yaml")
-
-        monkeypatch.setattr("bot.pipeline.load_prompts", _broken_yaml)
-
-        with pytest.raises(RuntimeError):
-            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
-
-        assert len(thread.sent) == 1
-        assert "упс: LLM недоступна" in thread.sent[0]
-        assert status.deleted
-        assert disk_reads == [], "error-путь не должен перечитывать prompts.yaml"
-
-    def test_error_message_strips_mentions_from_reason(
-        self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
-    ):
-        # LLM/провайдер могут вернуть текст с mention: фрагмент сырья уходит в
-        # {reason}, но бот не должен тегать людей в треде
-        thread = make_thread(4242)
-        status = make_status()
-        extractor = make_extractor(transcripts={URL: "субтитры"})
-        deps = make_deps(
-            thread=thread,
-            llm=make_llm(raw="@everyone сломалось, пинг <@123"),
-            router=make_router([extractor]),
-        )
-
-        with pytest.raises(ReportParseError):
-            asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
-
-        assert len(thread.sent) == 1
-        sent = thread.sent[0]
-        assert "сломалось" in sent, "причина ошибки попала в сообщение"
-        assert "@everyone" not in sent, "mention @everyone вырезан из {reason}"
-        assert "<@" not in sent, "начало <@-пинга вырезано из {reason}"
-        assert status.deleted
-
-    def test_unknown_kind_posts_error_and_raises(
-        self, make_deps, make_thread, make_status, make_extractor, make_router
-    ):
-        # kind джобы нет в реестре экстракторов: error-путь с человеческим
-        # текстом (а не AttributeError на None.extract); исключение
-        # пробрасывается — воркер пометит джобу failed
-        thread = make_thread(4242)
-        status = make_status()
         extractor = make_extractor(transcripts={URL: "субтитры"})
         deps = make_deps(thread=thread, router=make_router([extractor]))
-        job = _job(extractor, thread.id, status=status)
+        job = _job(extractor, thread.id)
         job["kind"] = "gone"
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="неизвестный тип источника: gone"):
             asyncio.run(process_job(deps, job))
 
-        assert any("неизвестный тип источника: gone" in c for c in thread.sent), (
-            "человеческий текст причины в треде"
-        )
-        assert status.deleted
+        assert thread.sent == [], "бот молчит, причина — в логе и в БД"
 
-    def test_send_failure_on_error_buffers_message_and_keeps_status(
+    def test_send_failure_still_raises_after_buffering(
         self, make_deps, make_client, make_status, make_extractor, make_router
     ):
-        # Discord лежит И экстрактор упал: error-сообщение буферизуется, статус
-        # НЕ закрывается (симметрично success-ветке), исключение пробрасывается —
-        # воркер пометит джобу failed
+        # Discord лежит И экстрактор упал: ничего не доставляется и не
+        # буферизуется (буфер — только для готового разбора), исключение
+        # пробрасывается — воркер пометит джобу failed
         thread = FailAfterThread(4242, ok_sends=0)
         status = make_status()
         extractor = make_extractor(extract_error=RuntimeError("нет доступных субтитров"))
@@ -332,13 +300,140 @@ class TestErrorPath:
         with pytest.raises(RuntimeError):
             asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
-        assert thread.sent, "попытки отправки error-сообщения были"
-        items = deps.outbox.load()
-        assert len(items) == 1 and "нет доступных субтитров" in items[0]["content"], (
-            "error-сообщение целиком в буфере"
+        assert deps.outbox.load() == [], "error-текст не буферизуется"
+        assert status.deleted, "статус старого формата — шум бота, удаляется даже при ошибке"
+
+
+class TestLazyThread:
+    """Тред джобы нового формата создаётся из сообщения, когда разбор готов."""
+
+    def test_thread_created_from_message_before_delivery(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router
+    ):
+        thread = make_thread(4242)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=thread,
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
         )
-        assert all(i["thread_id"] == thread.id for i in items)
-        assert not status.deleted, "при буферизации статусное сообщение остаётся"
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", thread=thread, channel=channel)
+        deps.client.channels[channel.id] = channel
+
+        asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
+
+        # тред создан под исходным сообщением: имя из джобы, авто-архив 1440
+        assert msg.thread_kwargs == {"name": "Тест треда", "auto_archive_duration": 1440}
+        assert thread.sent == [f"**Разбор: <{LINK}>**\n\n**Кратко**\n\nКоротко и ясно"], (
+            "разбор доставлен в созданный тред"
+        )
+
+    def test_160004_reuses_existing_thread(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router
+    ):
+        # тред под сообщением уже существует (создан до падения процесса):
+        # 160004 -> переиспользуем через find_existing_thread
+        existing = make_thread(2002)
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=make_thread(999999),
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        channel = make_channel()
+        msg = make_message(
+            f"глянь {URL}", id=2002, thread=ThreadAlreadyExistsError(), channel=channel
+        )
+        channel.threads = [existing]
+        deps.client.channels[channel.id] = channel
+
+        asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
+
+        assert existing.sent, "отчёт доставлен в переиспользованный тред"
+        assert existing.sent[0].startswith(f"**Разбор: <{LINK}>**")
+
+    def test_no_permission_raises_without_delivery(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router
+    ):
+        # Discord запретил создание треда: исключение (mark_failed), разбора
+        # нигде нет; разбор уже в кеше — повторная ссылка попробует снова
+        forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="x"), "нет прав")
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=make_thread(4242),
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", thread=forbidden, channel=channel)
+        deps.client.channels[channel.id] = channel
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
+
+        assert msg._thread is forbidden
+
+    def test_unresolvable_channel_raises(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router
+    ):
+        # канала нет ни в кэше клиента, ни через fetch: тред не создать
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=make_thread(4242),
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", channel=channel)
+        # канал НЕ зарегистрирован в клиенте
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
+
+        assert msg.thread_kwargs is None
+
+    def test_unfetchable_message_raises(
+        self, make_deps, make_thread, make_channel, make_message, make_llm, make_extractor, make_router
+    ):
+        # сообщение удалили до обработки джобы: create_thread не из чего
+        extractor = make_extractor(transcripts={URL: "субтитры"})
+        deps = make_deps(
+            thread=make_thread(4242),
+            llm=make_llm(analysis_json=dict(MINIMAL_ANALYSIS)),
+            router=make_router([extractor]),
+        )
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", channel=channel)
+        deps.client.channels[channel.id] = channel
+        del channel.messages[msg.id]  # «сообщение исчезло»
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
+
+        assert msg.thread_kwargs is None
+
+    def test_author_not_built_when_extraction_failed(
+        self, make_deps, make_thread, make_channel, make_message, make_extractor, make_router, make_author_facts
+    ):
+        # обзор автора только при собранном разборе: сбой добычи контента —
+        # ни треда, ни обращений к провайдеру автора
+        extractor = make_extractor(extract_error=RuntimeError("нет субтитров"))
+        author_facts = make_author_facts(
+            get_author_ref_result=None, get_channel_result=None
+        )
+        deps = make_deps(
+            thread=make_thread(4242),
+            author_facts=author_facts,
+            router=make_router([extractor]),
+        )
+        channel = make_channel()
+        msg = make_message(f"глянь {URL}", channel=channel)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(process_job(deps, _channel_job(extractor, channel, msg)))
+
+        assert author_facts.ref_calls == [], "провайдер автора не зовётся при сбое"
 
 
 class FailAfterThread:

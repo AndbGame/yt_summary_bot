@@ -9,11 +9,12 @@
   кеш отчётов пишется под canonical "article:...";
 - повторная ссылка с utm-хвостом — другое сообщение (дедуп пропускает), но тот же
   canonical: extract качает страницу снова (content_hash), а LLM зовётся один раз;
-- NotAnArticle (мало текста) с пустым кешем: статус отредактирован вежливым
-  отказом, в треде НЕТ error-сообщения, джоба завершается штатно (mark_done),
-  тред пуст; если разбор этой ссылки уже лежит в кеше (текст исчез/стал
-  не-статьёй позже) — доставляется отчёт из кеша, а не отказ;
-- сетевой сбой сайта (500): error-сообщение «страница недоступна», mark_failed;
+- NotAnArticle (мало текста) с пустым кешем: бот молчит (сообщений об ошибках
+  нет), тред не создаётся, джоба завершается штатно (mark_done); если разбор
+  этой ссылки уже лежит в кеше (текст исчез/стал не-статьёй позже) —
+  доставляется отчёт из кеша;
+- сетевой сбой сайта (500): бот молчит, джоба помечена failed (mark_failed),
+  тред не создаётся;
 - автор-блока у статей нет даже при meta author: автор живёт в doc.data["author"]
   и не попадает в обзор автора (author_ref None).
 
@@ -50,9 +51,11 @@ ARTICLE_ANALYSIS = {
     ],
 }
 
-POLITE_REJECTION = (
-    "🤔 По ссылке не нашлось статьи с текстом. Если это видео — дай ссылку на YouTube."
-)
+
+def _wire_channel(deps, msg):
+    """Канал сообщения регистрируется в клиенте: воркер резолвит его по
+    channel_id и создаёт тред из сообщения (UX-итерация)."""
+    deps.client.channels[msg.channel.id] = msg.channel
 
 
 def _fixture_html(name: str) -> str:
@@ -110,6 +113,7 @@ class TestArticleFlow:
         msg = make_message(f"почитай {ARTICLE_URL}", thread=thread)
 
         asyncio.run(handle(msg, deps))
+        _wire_channel(deps, msg)
 
         rows = deps.jobs.take_new()
         assert len(rows) == 1
@@ -144,11 +148,16 @@ class TestArticleFlow:
         # джоба завершена штатно
         assert deps.jobs.count_new() == 0
         assert deps.jobs.failed_calls == []
-        assert msg.status.deleted
+        # бот молчал в чате, тред создан воркером из сообщения (имя без ссылки)
+        assert msg.replies == [] and msg.status.edits == []
+        assert msg.thread_kwargs == {
+            "name": "почитай",
+            "auto_archive_duration": 1440,
+        }
 
     def test_repeat_link_with_utm_hits_cache(
         self, make_deps, make_message, make_thread, make_llm, make_article_fetch, make_job_store,
-        make_router,
+        make_router, make_channel,
     ):
         thread = make_thread(4242)
         fetch = make_article_fetch(_fixture_html("article_full.html"))
@@ -159,8 +168,10 @@ class TestArticleFlow:
             router=make_router([_youtube_no_network(), article]),
             jobs=make_job_store(),
         )
-        msg1 = make_message(f"почитай {ARTICLE_URL}", id=4001, thread=thread)
-        msg2 = make_message(f"почитай {UTM_URL}", id=4002, thread=thread)
+        channel = make_channel()
+        msg1 = make_message(f"почитай {ARTICLE_URL}", id=4001, thread=thread, channel=channel)
+        msg2 = make_message(f"почитай {UTM_URL}", id=4002, thread=thread, channel=channel)
+        _wire_channel(deps, msg1)  # общий канал обоих сообщений
 
         # оба цикла «handle -> воркер» в одной петле: asyncio.Queue привязывается
         # к петле при ожидании (см. комментарий в tests/e2e/test_author_flow.py)
@@ -192,12 +203,12 @@ class TestArticleFlow:
         assert deps.jobs.count_new() == 0
         assert deps.jobs.failed_calls == []
 
-    def test_junk_link_gets_polite_rejection(
+    def test_junk_link_is_silent_no_thread(
         self, make_deps, make_message, make_thread, make_llm, make_article_fetch, make_job_store,
-        make_router,
+        make_router, make_channel
     ):
-        # «не-статья» (мало текста) — вежливый отказ вместо error-сообщения:
-        # джоба завершается нормально, тред остаётся пустым
+        # «не-статья» (мало текста) — бот молчит: сообщений об ошибках нет,
+        # тред не создаётся; джоба завершается нормально (mark_done)
         thread = make_thread(4242)
         fetch = make_article_fetch(_fixture_html("junk_page.html"))
         article = _article_extractor(fetch)
@@ -210,21 +221,24 @@ class TestArticleFlow:
         msg = make_message(f"глянь {ARTICLE_URL}", thread=thread)
 
         asyncio.run(handle(msg, deps))
+        _wire_channel(deps, msg)
         _run_worker_once(deps)
 
-        assert POLITE_REJECTION in msg.status.edits, "статус отредактирован вежливым отказом"
-        assert thread.sent == [], "тред остался пустым (error-сообщение не отправлялось)"
+        assert msg.replies == [] and msg.status.edits == [], "бот молчит"
+        assert msg.thread_kwargs is None, "тред без полезного разбора не создаётся"
+        assert thread.sent == []
         assert deps.llm.calls == [], "LLM для не-статьи не зовётся"
         assert deps.jobs.count_new() == 0, "джоба завершена штатно (mark_done)"
-        assert deps.jobs.failed_calls == [], "вежливый отказ — не ошибка джобы"
+        assert deps.jobs.failed_calls == [], "не-статья — не ошибка джобы"
         assert deps.outbox.load() == []
 
     def test_not_an_article_with_cached_report_delivers_cache(
         self, make_deps, make_message, make_thread, make_llm, make_article_fetch, make_job_store,
-        make_router,
+        make_router
     ):
         # страница стала не-статьёй, но разбор этой ссылки уже лежит в кеше:
-        # отдаётся прошлый разбор (как при сетевом сбое), а не вежливый отказ
+        # отдаётся прошлый разбор (как при сетевом сбое) — это полезная
+        # информация, тред создаётся и отчёт доставляется
         thread = make_thread(4242)
         fetch = make_article_fetch(_fixture_html("junk_page.html"))
         article = _article_extractor(fetch)
@@ -245,19 +259,19 @@ class TestArticleFlow:
         msg = make_message(f"почитай {ARTICLE_URL}", thread=thread)
 
         asyncio.run(handle(msg, deps))
+        _wire_channel(deps, msg)
         _run_worker_once(deps)
 
         assert thread.sent, "отчёт из кеша доставлен вместо отказа"
         assert "Суть статьи в двух предложениях." in "\n".join(thread.sent)
-        assert POLITE_REJECTION not in msg.status.edits, "вежливого отказа нет"
-        assert msg.status.deleted, "статус закрыт после доставки"
+        assert msg.thread_kwargs is not None, "тред создан воркером из сообщения"
         assert deps.llm.calls == [], "LLM не зовётся — отчёт уже в кеше"
         assert deps.jobs.count_new() == 0
         assert deps.jobs.failed_calls == [], "доставка из кеша — не ошибка джобы"
 
-    def test_site_500_posts_error_and_marks_job_failed(
+    def test_site_500_fails_silently_marks_job_failed(
         self, make_deps, make_message, make_thread, make_llm, make_article_fetch, make_job_store,
-        make_router,
+        make_router
     ):
         thread = make_thread(4242)
         fetch = make_article_fetch(_fixture_html("article_full.html"), status=500)
@@ -271,13 +285,13 @@ class TestArticleFlow:
         msg = make_message(f"глянь {ARTICLE_URL}", thread=thread)
 
         asyncio.run(handle(msg, deps))
+        _wire_channel(deps, msg)
         _run_worker_once(deps)
 
-        # сетевой сбой сайта — обычный error-путь, а не вежливый отказ
-        assert len(thread.sent) == 1
-        assert "страница недоступна" in thread.sent[0]
-        assert POLITE_REJECTION not in thread.sent[0]
-        assert msg.status.deleted
+        # сетевой сбой сайта: бот молчит, тред не создаётся, причина — в БД
+        assert msg.replies == [] and msg.status.edits == []
+        assert msg.thread_kwargs is None, "тред без полезного разбора не создаётся"
+        assert thread.sent == []
         assert len(deps.jobs.failed_calls) == 1, "джоба помечена failed"
         assert "страница недоступна" in deps.jobs.failed_calls[0][1]
         assert deps.llm.calls == []
@@ -310,6 +324,7 @@ class TestArticleFlow:
         msg = make_message(f"почитай {ARTICLE_URL}", thread=thread)
 
         asyncio.run(handle(msg, deps))
+        _wire_channel(deps, msg)
         _run_worker_once(deps)
 
         assert network_calls == [], "для не-YouTube ссылки сеть провайдера не трогается"

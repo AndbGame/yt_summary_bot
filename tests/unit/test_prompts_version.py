@@ -64,6 +64,9 @@ def test_legacy_top_level_prompts_removed():
     assert "user" not in prompts, "старый user заменён на content_analysis.user"
 
 
-def test_error_template_kept():
-    error = load_prompts().get("error")
-    assert isinstance(error, str) and "{reason}" in error, "error-шаблон с {reason} остаётся"
+def test_error_and_rejection_texts_removed():
+    # UX-итерация: сбой без полезного разбора — тишина, сообщений об ошибках
+    # и вежливых отказов у бота больше нет
+    prompts = load_prompts()
+    assert "error" not in prompts, "error-шаблон удалён (бот молчит при сбое)"
+    assert "not_an_article" not in prompts, "вежливый отказ удалён (тишина, тред не создаётся)"

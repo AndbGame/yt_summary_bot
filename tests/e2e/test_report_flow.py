@@ -5,13 +5,13 @@
   тезисы, разделы с таймкод-ссылками];
 - превышенный бюджет блока -> рендер помечает сообщение маркером обрезки,
   доставка не падает;
-- LLM вернул мусор (не JSON) после всех попыток -> error-промпт, в кеш ничего
-  не попадает; process_job пробрасывает исключение после доставки (воркер
-  пометит джобу failed, фаза 4).
+- LLM вернул мусор (не JSON) после всех попыток -> бот молчит (сообщений об
+  ошибках больше нет), в кеш ничего не попадает; process_job пробрасывает
+  исключение (воркер пометит джобу failed, фаза 4).
 
 Отдельного «текстового» фоллбека в контракте НЕТ: непарсимый ответ — это ретраи
-LLMClient и, после исчерпания попыток, исключение -> error-промпт (здесь
-эмулируется фейком через raw=..., ретраи покрыты tests/unit/test_llm.py).
+LLMClient и, после исчерпания попыток, исключение -> тишина (здесь эмулируется
+фейком через raw=..., ретраи покрыты tests/unit/test_llm.py).
 """
 
 import asyncio
@@ -38,7 +38,7 @@ ANALYSIS = {
 
 # бюджеты как в prompts.yaml фазы 2
 BUDGETS = {"brief": 240, "context": 400, "theses": 1200, "section": 1200, "author": 900}
-PROMPTS = {"version": "2", "error": "Не смог: {reason}", "budgets": BUDGETS}
+PROMPTS = {"version": "2", "budgets": BUDGETS}
 
 
 def _job(extractor, thread_id, **extra):
@@ -124,7 +124,7 @@ class TestProgressiveDelivery:
         # тезисы в бюджете — не обрезаны
         assert thread.sent[1] == "**Тезисы**\n\n- тезис"
 
-    def test_garbage_answer_posts_error_and_not_cached(
+    def test_garbage_answer_raises_silently_and_not_cached(
         self, make_deps, make_thread, make_status, make_llm, make_extractor, make_router
     ):
         thread = make_thread(4242)
@@ -140,9 +140,6 @@ class TestProgressiveDelivery:
         with pytest.raises(ReportParseError):
             asyncio.run(process_job(deps, _job(extractor, thread.id, status=status)))
 
-        assert len(thread.sent) == 1, "после исчерпания попыток — один error-промпт"
-        assert "Не смог" in thread.sent[0]
-        # ReportParseError включает фрагмент сырья — он попадает в {reason}
-        assert "мне жаль, я не понял запрос" in thread.sent[0]
-        assert status.deleted
+        assert thread.sent == [], "бот молчит: сообщений об ошибках нет"
+        assert status.deleted, "статус старого формата удаляется даже при ошибке"
         assert not deps.reports._reports, "ошибка не кешируется"
