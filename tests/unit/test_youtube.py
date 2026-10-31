@@ -192,3 +192,22 @@ class TestYoutubeExtractor:
 def test_fetch_transcript_is_available():
     # сигнатура закреплена (дефолт экстрактора), но саму сеть не тестируем
     assert callable(youtube.fetch_transcript)
+
+
+def test_fetch_transcript_translates_no_subtitles(monkeypatch):
+    # треков нет вовсе (TranscriptsDisabled — трейлеры, клипы) — штатный
+    # доменный исход: наружу компактный RuntimeError с id видео, а не
+    # двухэкранный traceback библиотеки; фолбэк на list не нужен
+    from youtube_transcript_api import TranscriptsDisabled
+
+    class _FakeApi:
+        def fetch(self, video_id, languages):
+            raise TranscriptsDisabled(video_id)
+
+        def list(self, video_id):
+            raise AssertionError("list не должен вызываться, когда fetch сказал TranscriptsDisabled")
+
+    monkeypatch.setattr(youtube.youtube_transcript_api, "YouTubeTranscriptApi", _FakeApi)
+
+    with pytest.raises(RuntimeError, match="нет субтитров у видео abcdefghijk"):
+        youtube.fetch_transcript("abcdefghijk")

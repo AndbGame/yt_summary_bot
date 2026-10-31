@@ -11,6 +11,7 @@ import logging
 import re
 
 import youtube_transcript_api
+from youtube_transcript_api import TranscriptsDisabled
 
 from bot.sources.base import SourceDocument
 
@@ -45,6 +46,11 @@ def fetch_transcript(video_id: str) -> str:
     api = youtube_transcript_api.YouTubeTranscriptApi()
     try:
         tr = api.fetch(video_id, languages=["ru", "en"])
+    except TranscriptsDisabled:
+        # треков нет вовсе (трейлеры, клипы) — штатный доменный исход, а не
+        # сбой: наружу компактная причина, чтобы лог и джоба не тащили
+        # двухэкранный traceback библиотеки
+        raise RuntimeError(f"нет субтитров у видео {video_id}") from None
     except Exception:
         tr_list = api.list(video_id)
         codes = [t.language_code for t in tr_list]
